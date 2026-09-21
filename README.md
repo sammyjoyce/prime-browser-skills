@@ -1,0 +1,203 @@
+# prime-browser-skills
+
+Seven Prime Agent skills for browser work: two runtime skills that drive a real Chrome,
+and five report-only QA workflow skills that use them.
+
+| Skill | Type | What it does |
+|---|---|---|
+| `skills/browser-use` | Python skill | Runs a whole browser task with `browser-use-pi`. Structured extraction, open-ended pages, saved logins. |
+| `skills/jev` | Python skill | Runs navigation, forms, and defined multi-step interactions with the pinned Jev runtime. |
+| `skills/web-qa` | Markdown skill | Routes a QA request and runs the smoke pass. |
+| `skills/web-dogfood` | Markdown skill | Bounded exploratory testing against real user goals. |
+| `skills/web-visual-qa` | Markdown skill | Compares a UI with a named visual reference. |
+| `skills/web-accessibility-qa` | Markdown skill | Keyboard, accessibility tree, and contrast evidence. |
+| `skills/web-interaction-qa` | Markdown skill | Checks that a UI action really changes backend state. |
+
+The QA skills are instruction-shaped. They ship no scripts and no packages.
+
+## Requirements
+
+- macOS or Linux.
+- Prime Agent with its Python skill loader.
+- Installed Google Chrome or Chromium. Neither skill downloads a browser.
+- `browser-use`: Python 3.11+, Node 22.19+, `OPENAI_API_KEY`.
+- `jev`: `uv`, Python 3.12+ for its separate runtime, `OPENROUTER_API_KEY`.
+
+## Install
+
+Prime Agent loads skills from `~/.prime/agent/skills/<name>/`. Copy or link the
+directories you want:
+
+```sh
+git clone https://github.com/sammyjoyce/prime-browser-skills
+cd prime-browser-skills
+python3 install.py --dry-run            # show what would happen
+python3 install.py                      # copy into ~/.prime/agent/skills
+```
+
+As alternatives, use `--link` to symlink instead of copying, or
+`--only browser-use jev` to select specific skills. Existing destinations are skipped.
+`--force` replaces an existing destination and removes its contents; review local changes
+before using it and repeat runtime setup afterwards.
+
+`install.py` uses the standard library only. `--dest` installs somewhere else, which is
+useful for a test install. The destination may not be the repository `skills/` directory
+or anything inside it, because that would overwrite or recurse into the source. The copy
+drops local state: caches, virtual environments, `node_modules`, artifacts, profiles,
+sessions, logs, and every `.env` file except `.env.example`. Plain
+`cp -R skills/<name> ~/.prime/agent/skills/` works too.
+
+Start a new Prime Agent session, or restart the Python kernel, after installing.
+`browser_use` and `jev` are then pre-imported in the kernel. Do not install another
+package named `browser_use`.
+
+## Runtime setup
+
+`browser-use` pins its Node runner to `@browser_use/pi` 0.1.0 with a lockfile:
+
+```sh
+cd ~/.prime/agent/skills/browser-use
+npm ci --ignore-scripts --no-audit --no-fund
+```
+
+`jev` installs its own locked Python 3.12 runtime. It never installs into the kernel:
+
+```sh
+cd ~/.prime/agent/skills/jev
+uv sync --project runtime --frozen
+```
+
+A missing dependency is a setup error. Neither skill installs anything in the
+background.
+
+## Models and credentials
+
+- The `browser-use` default model is exactly `openai/gpt-6-astra`. The runner honors
+  `OPENAI_BASE_URL` when it is set, and keeps that exact model selector.
+- `BROWSER_USE_MODEL` can select another provider-qualified SDK model. That provider
+  needs its own valid credentials.
+- `jev` is a separate action executor. It uses `OPENROUTER_API_KEY` for both the Jev
+  decision model and the `inception/mercury-2.5` text helper. It does not change the
+  `browser_use` default.
+- An Astra result reports the model as `result["model"]`. A `browser_use` result has no
+  `resolved_model` field.
+- A Jev result reports `result["model"]` for the requested decision model and
+  `result["resolved_model"]` for the version OpenRouter returned. The text helper has
+  `result["helper_model"]` and `result["resolved_helper_model"]`. Report the model the
+  run returned, not the default.
+- There is no silent model or provider fallback, and no automatic replay of a task that
+  may already have submitted a form.
+- Never print a key value. Set credentials in the environment that Prime Agent inherits.
+
+## Results and screenshots
+
+Every completed run saves a PNG and returns absolute paths. `jev` captures the PNG
+directly through Chrome CDP.
+
+A path in a message is not an image. The session that must see the screenshot calls the
+native `attach_image` skill:
+
+```python
+print(await attach_image(result["screenshot_path"]))
+```
+
+A Jev result nests its completion fields under `output`:
+
+```python
+result["output"]["verification"]        # always "not_performed"
+result["output"]["completion_claimed"]  # True when Jev chose DONE
+result["output"]["final_url"]           # with final_title and page_text
+```
+
+A completed status means the executor claimed the task was done, the screenshot was
+saved, and cleanup succeeded. It is not independent proof. Check the real postcondition,
+and for writes check the saved state rather than a success message.
+
+Every non-completed status raises a typed error that keeps the real provider message and
+any partial result.
+
+## Profiles
+
+Logins persist in named profiles:
+
+- `browser-use`: `~/.prime/agent/browser-use/profiles/<profile>/`, moved with
+  `BROWSER_USE_HOME`.
+- `jev`: `$JEV_HOME/profiles/<profile>/`, default `~/.prime/agent/jev`.
+
+The two skills keep separate profile trees. The same name in both does not share a
+login. One process owns a profile at a time; a second caller fails instead of queueing.
+Use different profile names for parallel tasks. Do not point either skill at your daily
+Chrome user-data directory.
+
+## Capability limits
+
+- Jev chooses code-owned actions from the observed DOM. It takes no output schema and
+  writes no free-form answer. Use `browser_use` with Astra for typed extraction and
+  open-ended reasoning.
+- Shadow DOM, iframes, canvas, upload, popups, and arbitrary keyboard input are not
+  established capabilities. Verify or report the task as blocked.
+- Jev's text helper writes free-text values. It can change a value, for example by
+  adding punctuation. Give exact values as quoted strings or a JSON object, and read the
+  saved value back before you report success.
+- Native iOS and Android apps are out of scope for both skills.
+- Cost limits are soft. They are checked between requests, so a run can overshoot by one
+  request. Missing usage data is unknown, never free.
+- A natural-language prohibition in a task is not a sandbox. Page content can be hostile,
+  and browser-driven JavaScript has host filesystem and network access. Use an isolated
+  machine for untrusted browsing.
+- Artifacts, profiles, page text, and screenshots can hold private data. Known
+  environment secret values are redacted from returned text, but screenshots are not
+  sanitized. Review artifacts before publishing them.
+
+## Validation status
+
+Each runtime skill ships deterministic tests that use fake runners, so they need no key,
+no Chrome, and no paid call:
+
+Run each command from the repository root. None of them changes the working
+directory:
+
+```sh
+npm --prefix skills/browser-use ci --ignore-scripts --no-audit --no-fund
+npm --prefix skills/browser-use test
+uv run --project skills/browser-use python -m unittest discover -s skills/browser-use/tests -v
+uv sync --project skills/jev/runtime --frozen
+uv run --project skills/jev python -m unittest discover -s skills/jev/tests -v
+uv run --project skills/jev/runtime --frozen python skills/jev/runtime/tests/run_tests.py
+python3 -m unittest discover -s tests -v
+```
+
+The last command tests `install.py` and needs no browser and no dependency install.
+The Jev runtime suite also takes `--group browser` and `--group login`. Those two groups
+start a real Chrome. They still make no model call.
+
+`uv` and `npm` create `.venv` and `node_modules` inside the skill directories. Both are
+ignored by git.
+
+Run from this public checkout with provider credentials removed, these suites reported
+98 Jev runtime checks, 50 Jev wrapper tests, 33 browser-use Node tests, 35 browser-use
+Python tests, and 9 installer tests, with no failures. They include fake-runner and
+offline runtime checks and make no model call. They do not establish live task success.
+
+Live validation of the native `jev` package is still in progress. A live navigation task
+passed. A live form task has failed in two different ways, and both failures are kept on
+record. Do not read these deterministic results, or the benchmark below, as proof that
+form tasks are validated. `skills/jev/VALIDATION.md` holds the live record and is not
+allowed to mark a planned check as passed.
+
+## Benchmark summary
+
+An early comparison ran 18 attempts over three local HTML fixture tasks, nine per
+engine. Jev passed 9/9 independently verified checks; Astra passed 8/9. Over the eight
+attempt pairs where both engines passed, summed wall time was 75.5 s for Jev against
+511.0 s for Astra, a 6.76x ratio.
+
+The two engines do not account for cost the same way. Jev uses OpenRouter per-request
+costs; Astra uses the SDK catalog estimate. Treat any cost ratio as approximate. This is
+a small local-fixture sample. It supports the executor split for action-heavy HTML
+tasks. It is not evidence of production reliability or native app coverage. The raw
+benchmark artifacts are not published here.
+
+## License
+
+MIT, see `LICENSE`. Third-party code and attribution are listed in `THIRD_PARTY.md`.

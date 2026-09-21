@@ -1,0 +1,13 @@
+[project]
+name = "jev-runtime"
+version = "0.1.0"
+description = "Isolated runtime for the native Jev browser skill."
+requires-python = ">=3.12"
+dependencies = ["jev-ultrafast"]
+
+[tool.uv.sources]
+jev-ultrafast = { path = "vendor/jev-ultrafast" }
+
+[tool.uv]
+package = false
+default-groups = []

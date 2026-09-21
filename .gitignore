@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+
+# Local runtime state and private artifacts
+artifacts/
+profiles/
+sessions/
+logs/
+screenshots/
+.bu-pi.lock
+
+# Credentials. Only the committed placeholder example is allowed.
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*_rsa
+*.key
+
+# Captures and recordings. This repository publishes no binary media.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.webm
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# OS
+.DS_Store
