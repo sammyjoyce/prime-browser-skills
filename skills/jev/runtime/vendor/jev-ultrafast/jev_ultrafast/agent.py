@@ -5,16 +5,37 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
-from .model import action_space, choose, field_context, field_text
+from .model import action_space, bind_value, choose, field_context, field_text
 from .questions import MAX_STEPS
+
+GENERATION = ("helper", "disabled")
+NOTHING_TYPED = "no value bound to this field; nothing typed"
+
+
+def binding_identity(action, page):
+    """Which observed field, in which document, a cached bind and text belong to.
+
+    ``node`` is the identity the snapshot gave that element, not its position in the
+    action list, and ``page_key[0]`` is the document's time origin. A second field with
+    the same label, a changed URL and a fresh document at one URL each produce a
+    different value here, so none of them can reuse the first field's text.
+    """
+    node, key = action.get("node"), page.get("page_key")
+    document = key[0] if isinstance(key, (list, tuple)) and key else None
+    return (node if type(node) is int else action.get("id"), document, page.get("url"))
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(self, url, goals, *, values=None, generation="helper", record_dir=None, screenshots=False):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
+        if generation not in GENERATION:
+            raise ValueError(f"generation must be one of {GENERATION}")
         plan = [task]
+        # Caller-supplied field values. They are copied into fields byte for byte.
+        self.values = dict(values) if values else {}
+        self.generation = generation
         self.pending_text = None
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
@@ -35,6 +56,7 @@ class Agent:
             plan_index=0,
             decisions=[],
             text_calls=[],
+            bind_calls=[],
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
@@ -48,6 +70,32 @@ class Agent:
             **{k: v for k, v in self.state.items() if k != "browser"},
             "elements": action_space(self.state["page"]["actions"])[0],
         }
+
+    def field_value(self, action, page, context):
+        """(text, helper, value_key, value_source) for one fill action.
+
+        A supplied value wins and is copied byte for byte. Otherwise the text
+        helper writes one, if generation allows it. Anything else is skipped,
+        which types nothing at all.
+        """
+        state = self.state
+        if self.values:
+            bind = bind_value(state["goal"], action, page, state["history"], self.values)
+            # Metadata only: the request holds value previews and never enters the state.
+            state["bind_calls"].append(
+                {
+                    **{k: bind[k] for k in ("key", "confidence", "probabilities", "usage", "latency_ms", "model")},
+                    "field": action["label"],
+                }
+            )
+            if bind["key"] is not None:
+                return self.values[bind["key"]], None, bind["key"], "supplied"
+        if self.generation != "helper":
+            return None, None, None, "skipped"
+        text, helper = field_text(context)
+        state["text_calls"].append({**helper, "field": action["label"], "value": text})
+        # The helper answered {"text": null}: no value exists, so nothing is typed.
+        return (None, helper, None, "skipped") if text is None else (text, helper, None, "helper")
 
     def command(self, name, body=None):
         body = body or {}
@@ -74,7 +122,7 @@ class Agent:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = choose(state["page"], state["goal"], state["history"])
+            state["decision"] = choose(state["page"], state["goal"], state["history"], values=self.values)
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -102,19 +150,24 @@ class Agent:
             if len(state["history"]) >= MAX_STEPS:
                 state["status"] = "blocked"
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
-            text, helper = None, None
+            text, helper, value_key, value_source = None, None, None, None
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
                 context = field_context(state["goal"], action, page, state["history"])
-                if self.pending_text and self.pending_text[0] == context:
-                    _, text, helper = self.pending_text
+                # The cache key covers the bind decision too, so a StalePage retry repeats
+                # neither the bind call nor the helper call. It names the observed field and
+                # its document, so only a real retry of that same field can reuse the text.
+                cached = (binding_identity(action, page), context, sorted(self.values), self.generation)
+                if self.pending_text and self.pending_text[0] == cached:
+                    _, text, helper, value_key, value_source = self.pending_text
                 else:
-                    text, helper = field_text(context)
-                    self.pending_text = (context, text, helper)
-                    state["text_calls"].append({**helper, "field": action["label"], "value": text})
+                    text, helper, value_key, value_source = self.field_value(action, page, context)
+                    self.pending_text = (cached, text, helper, value_key, value_source)
+            skipped = value_source == "skipped"
             # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text)
+            if not skipped:
+                state["browser"].act(action, page, text=text)
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
@@ -130,6 +183,9 @@ class Agent:
                     "text": text,
                     "text_helper": helper["model"] if helper else None,
                     "text_latency_ms": helper["latency_ms"] if helper else 0,
+                    "value_key": value_key,
+                    "value_source": value_source,
+                    "note": NOTHING_TYPED if skipped else None,
                     "operation": decision["operation"],
                     "target": decision["target"],
                     "page_changed": None,
@@ -142,7 +198,9 @@ class Agent:
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
-                page_changed=state["page"]["fingerprint"] != page["fingerprint"],
+                # A skipped field typed nothing, so this step changed nothing, whatever the
+                # page did on its own. Three of them in a row still stop the run.
+                page_changed=False if skipped else state["page"]["fingerprint"] != page["fingerprint"],
                 url=state["page"]["url"],
                 elapsed_ms=state["elapsed_ms"],
             )

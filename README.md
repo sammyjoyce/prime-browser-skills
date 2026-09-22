@@ -109,6 +109,21 @@ result["output"]["completion_claimed"]  # True when Jev chose DONE
 result["output"]["final_url"]           # with final_title and page_text
 ```
 
+`jev.run` also takes `values` and `generation` for exact form values:
+
+```python
+result = await jev.run(task, url=start_url, profile="work",
+                       values={"reviewer_name": "Ada Lovelace"})
+result["actions"][0]["value_key"]       # supplied key, or None
+result["actions"][0]["value_source"]    # "supplied", "helper", "skipped", or None
+```
+
+Values are typed byte for byte, and an empty string clears the field. `generation` is
+`"helper"` or `"disabled"`. It decides whether the text helper may write a value when
+none is bound, and it defaults to `"disabled"` when you pass `values` and to `"helper"`
+when you do not. The typed text never appears in the result. `skills/jev/SKILL.md` holds
+the full rules.
+
 A completed status means the executor claimed the task was done, the screenshot was
 saved, and cleanup succeeded. It is not independent proof. Check the real postcondition,
 and for writes check the saved state rather than a success message.
@@ -137,11 +152,17 @@ Chrome user-data directory.
 - Shadow DOM, iframes, canvas, upload, popups, and arbitrary keyboard input are not
   established capabilities. Verify or report the task as blocked.
 - Jev's text helper writes free-text values. It can change a value, for example by
-  adding punctuation. Give exact values as quoted strings or a JSON object, and read the
-  saved value back before you report success.
+  adding punctuation. Pass exact strings in `values` instead, which are typed byte for
+  byte, and set `generation="disabled"` to stop the helper writing anything. Read the
+  saved value back before you report success either way.
+- Keys and 80-character previews go to OpenRouter in the decision request, but that
+  preview is not a privacy bound. Once a value is typed, the full value is visible too,
+  in the observed field value and recent actions, and to the text helper when
+  `generation="helper"` runs. Never put a credential or private data in `values`.
 - Native iOS and Android apps are out of scope for both skills.
-- Cost limits are soft. They are checked between requests, so a run can overshoot by one
-  request. Missing usage data is unknown, never free.
+- Cost limits are soft. They are checked once per action, so a run can overshoot by the
+  requests of one action. One fill action can issue up to three requests: the decision
+  call, the bind call and the helper call. Missing usage data is unknown, never free.
 - A natural-language prohibition in a task is not a sandbox. Page content can be hostile,
   and browser-driven JavaScript has host filesystem and network access. Use an isolated
   machine for untrusted browsing.
@@ -174,16 +195,20 @@ start a real Chrome. They still make no model call.
 `uv` and `npm` create `.venv` and `node_modules` inside the skill directories. Both are
 ignored by git.
 
-Run from this public checkout with provider credentials removed, these suites reported
-98 Jev runtime checks, 50 Jev wrapper tests, 33 browser-use Node tests, 35 browser-use
-Python tests, and 9 installer tests, with no failures. They include fake-runner and
-offline runtime checks and make no model call. They do not establish live task success.
+On 2026-09-21, run from this public checkout with provider credentials removed, these
+suites reported 98 Jev runtime checks, 50 Jev wrapper tests, 33 browser-use Node tests,
+35 browser-use Python tests, and 9 installer tests, with no failures. The Jev suites
+have grown since, with exact-value binding; the current counts are 148 Jev runtime unit
+checks, 60 Jev wrapper tests, and 52 Jev vendor tests. All of these checks use fake
+runners or offline runtime paths and make no model call. They do not establish live task
+success.
 
 Live validation of the native `jev` package is still in progress. A live navigation task
 passed. A live form task has failed in two different ways, and both failures are kept on
-record. Do not read these deterministic results, or the benchmark below, as proof that
-form tasks are validated. `skills/jev/VALIDATION.md` holds the live record and is not
-allowed to mark a planned check as passed.
+record. Exact-value binding has deterministic tests with mocked model responses only and
+no live run at all. Do not read these deterministic results, or the benchmark below, as
+proof that form tasks are validated. `skills/jev/VALIDATION.md` holds the live record
+and is not allowed to mark a planned check as passed.
 
 ## Benchmark summary
 

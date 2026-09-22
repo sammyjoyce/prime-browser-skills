@@ -182,7 +182,22 @@ def browser_operation(request):
                         code="KeyA",
                         modifiers=4 if sys.platform == "darwin" else 2,
                     )
-                    call("Input.insertText", text=request["text"])
+                    if request["text"] == "":
+                        # Clearing a field: the select-all above is removed by a real Delete key
+                        # press, the same edit a person makes, so frameworks that listen for key
+                        # events see one. Input.insertText("") is an insertion of nothing, which
+                        # no key handler observes.
+                        for event in ("keyDown", "keyUp"):
+                            call(
+                                "Input.dispatchKeyEvent",
+                                type=event,
+                                key="Delete",
+                                code="Delete",
+                                windowsVirtualKeyCode=46,
+                                nativeVirtualKeyCode=46,
+                            )
+                    else:
+                        call("Input.insertText", text=request["text"])
         return {"executed": action["id"]}
 
     info = evaluate(READ_STATE)

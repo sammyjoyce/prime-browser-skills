@@ -124,6 +124,21 @@ def main():
         assert value == "Generated", repr(value)
         assert any(a.get("role") == "option" for a in page["actions"])
         passed.append("real text input waits for asynchronous combobox suggestions")
+
+        browser.evaluate("window.inputEvents=0; document.querySelector('#query')"
+                         ".addEventListener('input',()=>{window.inputEvents++})")
+        page = browser.observe(screenshot=False)
+        field = next(a for a in page["actions"] if a["kind"] == "fill")
+        # An empty supplied value means "clear this field", so it must really empty it.
+        browser.act(field, page, text="")
+        page = browser.observe(screenshot=False)
+        value = browser.evaluate("document.querySelector('#query').value")
+        assert value == "", repr(value)
+        events = browser.evaluate("window.inputEvents")
+        assert events >= 1, repr(events)
+        assert next(a for a in page["actions"] if a["kind"] == "fill")["value"] == ""
+        passed.append("an empty value clears the field and fires a real input event")
+
         browser.call("Page.navigate", url="about:blank")
         assert not browser.fresh(page, field)
         passed.append("navigation invalidates the old document")

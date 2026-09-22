@@ -12,9 +12,16 @@ This repository is MIT licensed, see `LICENSE`. The items below have their own t
 | Archive sha256 | `3bed2171ef064135c5192bad354b4a187f71ec397639d5ab676d02be37822211` |
 | License | MIT, retained at `skills/jev/runtime/vendor/jev-ultrafast/LICENSE` |
 | Path here | `skills/jev/runtime/vendor/jev-ultrafast/` |
+| Local changes | Six files, listed in `skills/jev/runtime/vendor/PROVENANCE.md` |
 
-The vendored tree is upstream source. No upstream file in it is edited. Every retained
-file is byte-identical to that pinned archive.
+The vendored tree is a maintained fork of that pinned archive, not a plain copy. Six
+files carry local changes: `jev_ultrafast/agent.py`, `jev_ultrafast/model.py`,
+`jev_ultrafast/questions.py`, `jev_ultrafast/browser.py`, `scripts/check_guards.py` and
+`tests/test_agent.py`. They add exact-value binding, let a null text-helper answer skip a
+field instead of ending the run, clear a field with a Delete key event, and add a fixture
+check that an empty value clears the field and fires an input event. Every other retained
+file is byte-identical to the archive. The MIT license and upstream copyright notice are
+kept with the source.
 
 This published copy omits two upstream paths:
 
@@ -23,12 +30,14 @@ This published copy omits two upstream paths:
   them.
 
 Upstream `README.md` links into `docs/`, so those links resolve only upstream.
-`skills/jev/runtime/vendor/PROVENANCE.md` records the same facts and gives the exact
-command to re-verify the tree against the pinned archive.
+`skills/jev/runtime/vendor/PROVENANCE.md` records the same facts, names each local
+change with its reason, and gives the exact command to diff the tree against the pinned
+archive.
 
-The `jev` skill adapts upstream behaviour at runtime only. Each adaptation is listed in
-the `DEVIATIONS` constant in `skills/jev/runtime/runner.py` and is returned with each
-result under `deviations`.
+The `jev` skill also adapts upstream behaviour at runtime. Each runtime adaptation is
+listed in the `DEVIATIONS` constant in `skills/jev/runtime/runner.py` and is returned
+with each result under `deviations`. That list carries a `fork:` entry naming the two
+in-tree behaviour changes as well.
 
 ## Dependencies
 
