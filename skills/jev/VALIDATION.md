@@ -449,14 +449,18 @@ uv run --project runtime --frozen python runtime/tests/run_tests.py --group logi
 `--group all` ran all 146 runtime checks on 2026-09-21, before the unit group grew. On
 2026-09-22 the unit group was 273 checks and the `checks` group 49; the declared-check
 follow-up that validates every result path took the unit group to 281, and the
-confidence, truncation and handoff work measured 514 on its own base. The row-fingerprint
-correspondence follow-up, on the declared-check layer alone, took the unit group to 288
-checks and the `checks` group to 51. With confidence, truncation and handoff stacked on
-the declared-check layer, before that follow-up, the unit group was 522 checks, the
-`checks` group unchanged at 49, and the new `guards` group 23. Those five figures are
-historical. With every layer combined in this tree, including the row-fingerprint
-correspondence fix and the four confidence-safety review fixes below, the unit group is
-605 checks, the `checks` group is 51, and the `guards` group is 23. The browser and login
+confidence, truncation and handoff work measured 514 on its own base. The
+row-fingerprint correspondence follow-up, on the declared-check layer alone, took the
+unit group to 288 checks and the `checks` group to 51. With confidence, truncation and
+handoff stacked on the declared-check layer, before that follow-up, the unit group was
+522 checks, the `checks` group unchanged at 49, and the new `guards` group 23. Those
+five figures are historical. With every layer combined in this tree, including the
+row-fingerprint correspondence fix and the four confidence-safety review fixes below,
+the unit group is 605 checks, the `checks` group is 51, and the `guards` group is 23;
+those three figures are historical too. With the three landing repairs in "Combined
+landing-repair validation" below (binding-identity cache, wrapper failure-path evidence,
+dispatch correlation), measured on 2026-09-22, the unit group is 640 checks, the
+`checks` group is still 51, and the `guards` group is still 23. The browser and login
 groups have not been re-run since 2026-09-21, so no new all-groups total is claimed. Raw
 local screenshots, browser profiles, provider logs and Prime Agent transcripts are not
 included in the public repository.
@@ -526,3 +530,67 @@ isolated patch measured 96 wrapper, 598 unit, 49 checks, 23 guards, 95 vendor,
 `run_operation` checks; the vendor group grew by the kind-based target-gate
 and `choose()` invariant cases. Combined live-tree totals are left to parent
 integration with A's tests.
+
+## Combined landing-repair validation
+
+Date: 2026-09-22. Scope: the three approved landing repairs, combined in this tree on
+`feat/jev-decision-safety`.
+
+1. Binding-identity cache fix, in vendor `agent.py`.
+2. Wrapper failure-path verification-evidence fix, in `src/jev/__init__.py`.
+3. Dispatch-correlation fix, in the runtime `agent.py` and `runner.py`.
+
+The first two are already committed (`72e4590`, `a4ceb59`). The third sat uncommitted
+in the working tree at validation time. Each repair was probed on its own before this
+run; those reports are `/tmp/jev-landing-fix-2.md`, `-3.md` and `-4.md`. Every command
+and count below is a fresh run against the combined tree. None of it copies those
+isolated numbers.
+
+Commands, all exit 0, run from `feat/jev-decision-safety`:
+
+```sh
+cd skills/jev
+uv sync --project runtime --frozen --reinstall-package jev-ultrafast
+uv run --frozen python -m unittest discover -s tests -v
+# Ran 112 tests in 40.976s, OK (0 skipped)
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group unit
+# 640 checks, 0 failed
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+# 51 checks, 0 failed
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group guards
+# 23 checks, 0 failed
+cd runtime/vendor/jev-ultrafast && uv run --frozen pytest -q
+# 106 passed
+uv run --frozen ruff check .
+# All checks passed!
+cd ../../../../.. && python3 -m unittest discover -s tests -v
+# Ran 10 tests in 1.149s, OK (installer, run alone after every suite above finished)
+```
+
+The pre-repair origin tip `0175169` measured 104 wrapper, 605 unit, 51 `checks`, 23
+`guards`, 95 vendor and 10 installer tests (see "Re-run deterministic checks" above).
+The combined tree adds 8 wrapper tests, 35 unit checks and 11 vendor tests. `checks`,
+`guards` and installer stay the same, because none of the three repairs touch
+`checks.py`, snapshot truncation or `install.py`.
+
+Each new-test claim was checked by name, not just by count:
+
+| Repair | New tests | Where confirmed | Result |
+|---|---|---|---|
+| Cache fix | 5 vendor tests | Re-selected with `pytest -k`, e.g. `test_stale_retry_does_not_reuse_a_binding_on_another_field` | All 5 pass |
+| Wrapper fix | 8 wrapper tests | `git diff 0175169..HEAD` on `tests/test_jev.py`: 8 new `def test_`, 0 removed | Ran inside the 112-test pass |
+| Dispatch-correlation fix | 6 vendor tests | `git diff` on the working-tree `tests/test_agent.py`: 6 new `def test_`, 0 removed; re-selected with `pytest -k` | All 6 pass |
+| Dispatch-correlation fix | 35 unit checks | `git diff` on the working-tree `run_tests.py`: 37 new `check()` calls, 2 rename existing checks onto the new contract, so 35 are net new | All 32 `dispatch_correlation.*` and 5 `safety.dispatch_*` checks pass |
+
+The installed runtime copy of `jev-ultrafast` matches the source. After the reinstall,
+`runtime/.venv/lib/python3.12/site-packages/jev_ultrafast/agent.py` is byte-identical to
+`runtime/vendor/jev-ultrafast/jev_ultrafast/agent.py`. It carries both `binding_identity`
+and `decision_seq`/`latest_dispatch`.
+
+No source file changed to reach these results. Only `README.md` and this file changed.
+No live model call ran, and no headed browser ran. `--group browser` and `--group
+login` did not run, so this entry says nothing about those two groups or about live
+provider behaviour. The `checks` and `guards` groups start and stop their own headless
+Chrome. Their own `snapshot.owned_chrome_is_gone` and `snapshot.no_daemon_was_left_behind`
+checks confirmed a clean exit. A process check after the run found no leftover Chrome
+or daemon process. No nested delegation ran this validation.

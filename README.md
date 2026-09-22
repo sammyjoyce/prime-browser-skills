@@ -265,10 +265,15 @@ unit checks and 85 wrapper tests on its own base, and 522 runtime unit checks, 4
 10 installer tests once stacked on the declared-DOM-checks layer, before that layer's
 own protocol-consistency follow-up. Those figures are historical. With every layer
 combined in the tree, including the protocol-consistency follow-up and the four
-confidence-safety review fixes, the current Jev counts are 605 runtime unit checks, 51
+confidence-safety review fixes, an earlier pass measured 605 runtime unit checks, 51
 `checks`-group checks and 23 `guards`-group checks against real headless Chrome, 104
-wrapper tests, 95 vendor tests, and 10 installer tests. The browser-use counts are still
-the 2026-09-21 measurements. None of these suites makes a model call. All except the
+wrapper tests, 95 vendor tests, and 10 installer tests; those six figures are historical
+too. On 2026-09-22, with the binding-identity cache fix, the wrapper failure-path
+evidence fix, and the dispatch-correlation fix combined in the tree, the current Jev
+counts are 640 runtime unit checks, 51 `checks`-group checks and 23 `guards`-group
+checks against real headless Chrome, 112 wrapper tests, 106 vendor tests, and 10
+installer tests. The browser-use counts are still the 2026-09-21 measurements. None of
+these suites makes a model call. All except the
 `checks` and `guards` groups use fake runners or offline runtime paths; those two groups
 drive real headless Chrome against a loopback fixture. None of them establishes
 live task success.

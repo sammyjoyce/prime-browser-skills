@@ -154,14 +154,57 @@ def test_safety_metadata(runner):
 
     check("safety.dispatch_unknown_without_state", runner.stopping_dispatch(None) == "unknown")
     check("safety.dispatch_not_dispatched_when_the_decision_made_no_row",
-          runner.stopping_dispatch({"history": [], "decisions": [{"choice": "DONE"}]})
-          == "not_dispatched")
-    check("safety.dispatch_reads_the_last_row",
+          runner.stopping_dispatch({
+              "history": [],
+              "decisions": [{"choice": "DONE", "decision_seq": 1}],
+              "latest_dispatch": {"decision_seq": 1, "dispatch": "not_dispatched"},
+          }) == "not_dispatched")
+    check("safety.dispatch_reads_the_decision_record",
+          runner.stopping_dispatch({
+              "history": [{"dispatch": "attempted", "decision_seq": 1}],
+              "decisions": [{"choice": "e1", "decision_seq": 1}],
+              "latest_dispatch": {"decision_seq": 1, "dispatch": "attempted"},
+          }) == "attempted")
+    check("safety.dispatch_of_an_unreadable_record_is_unknown",
+          runner.stopping_dispatch({
+              "history": [{"dispatch": "typed", "decision_seq": 1}],
+              "decisions": [{"choice": "e1", "decision_seq": 1}],
+              "latest_dispatch": {"decision_seq": 1, "dispatch": "typed"},
+          }) == "unknown")
+    # The record must name the decision the run stopped on. One that names an
+    # earlier decision describes something else and cannot be reported.
+    check("safety.dispatch_of_a_stale_record_is_unknown",
+          runner.stopping_dispatch({
+              "history": [{"dispatch": "attempted", "decision_seq": 1}],
+              "decisions": [{"choice": "e1", "decision_seq": 1},
+                            {"choice": "e1", "decision_seq": 2}],
+              "latest_dispatch": {"decision_seq": 1, "dispatch": "attempted"},
+          }) == "unknown")
+    # A state with no record at all is legacy or unreadable, never proof that
+    # nothing was sent.
+    check("safety.dispatch_without_a_record_is_unknown",
           runner.stopping_dispatch({"history": [{"dispatch": "attempted"}],
-                                    "decisions": [{"choice": "e1"}]}) == "attempted")
-    check("safety.dispatch_of_an_unreadable_row_is_unknown",
-          runner.stopping_dispatch({"history": [{"dispatch": "typed"}],
-                                    "decisions": [{"choice": "e1"}]}) == "unknown")
+                                    "decisions": [{"choice": "e1"}]}) == "unknown"
+          and runner.stopping_dispatch({"history": [], "decisions": []}) == "unknown"
+          and runner.stopping_dispatch({"history": [], "decisions": [{"choice": "DONE"}]})
+          == "unknown")
+    # The counts are the same shape on both of these and the answers differ, so
+    # no count can produce them. One dispatched click then a budget stop on a
+    # newer decision; one dispatched click that the run stopped on.
+    ambiguous = {"history": [{"dispatch": "attempted", "decision_seq": 1}],
+                 "decisions": [{"choice": "e1", "decision_seq": 1},
+                               {"choice": "e1", "decision_seq": 2}]}
+    check("safety.dispatch_separates_states_the_counts_cannot",
+          runner.stopping_dispatch({**ambiguous,
+                                    "latest_dispatch": {"decision_seq": 2,
+                                                        "dispatch": "not_dispatched"}})
+          == "not_dispatched"
+          and runner.stopping_dispatch({
+              "history": [{"dispatch": "attempted", "decision_seq": 2}],
+              "decisions": [{"choice": "e1", "decision_seq": 1},
+                            {"choice": "e1", "decision_seq": 2}],
+              "latest_dispatch": {"decision_seq": 2, "dispatch": "attempted"},
+          }) == "attempted")
 
     hostile = runner.build_handoff(
         "low_operation_confidence",
@@ -1343,7 +1386,8 @@ def drive_run_operation(runner, *, decisions, request=None, page=None, values=No
                         generation=None, confidence=None, checks=None, evidence_rows=None,
                         act_error=None, stale_inputs=None, binding=("address", 1.0),
                         helper_text="written by the helper", costs=None,
-                        observe_pages=None, fresh_seq=None, decision_costs=None):
+                        observe_pages=None, fresh_seq=None, decision_costs=None,
+                        observe_errors=None):
     """Run the real run_operation against fakes. Returns a report dict.
 
     Everything that would touch Chrome, the harness daemon or a provider is
@@ -1362,6 +1406,9 @@ def drive_run_operation(runner, *, decisions, request=None, page=None, values=No
     observe_pages = list(observe_pages or [])
     fresh_seq = list(fresh_seq or [])
     decision_costs = list(decision_costs) if decision_costs is not None else None
+    # One entry per observe() call: None reads the page, an exception instance
+    # is raised instead. Browser.observe is the read after input.
+    observe_errors = list(observe_errors or [])
     work = Path(tempfile.mkdtemp(prefix="jev-safety-")).resolve()
     artifact_dir = work / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1374,6 +1421,9 @@ def drive_run_operation(runner, *, decisions, request=None, page=None, values=No
 
         def observe(self, screenshot=False):
             calls["observes"] += 1
+            failure = observe_errors.pop(0) if observe_errors else None
+            if failure is not None:
+                raise failure
             current = observe_pages.pop(0) if observe_pages else base_page
             return json.loads(json.dumps(current))
 
@@ -1432,6 +1482,7 @@ def drive_run_operation(runner, *, decisions, request=None, page=None, values=No
         "install_provider_patch": runner.install_provider_patch,
         "start_private_daemon": runner.start_private_daemon,
         "capture_png": runner.capture_png,
+        "safe_snapshot": runner.safe_snapshot,
     }
     previous_cdp = os.environ.get("BU_CDP_URL")
     previous_name = os.environ.get("BU_NAME")
@@ -1455,6 +1506,15 @@ def drive_run_operation(runner, *, decisions, request=None, page=None, values=No
         runner.install_provider_patch = lambda: None
         runner.start_private_daemon = lambda *_a, **_k: None
         runner.capture_png = fake_capture_png
+
+        def capture_snapshot(agent):
+            # The real snapshot, kept so a test can read the executor's own
+            # correlation between its decisions, its rows and what it sent.
+            state = saved["safe_snapshot"](agent)
+            calls["final_state"] = state
+            return state
+
+        runner.safe_snapshot = capture_snapshot
 
         payload = {
             "op": "run", "task": TASK_SECRET, "url": "https://app.test/form",
@@ -1484,6 +1544,7 @@ def drive_run_operation(runner, *, decisions, request=None, page=None, values=No
         runner.install_provider_patch = saved["install_provider_patch"]
         runner.start_private_daemon = saved["start_private_daemon"]
         runner.capture_png = saved["capture_png"]
+        runner.safe_snapshot = saved["safe_snapshot"]
         for name, value in (("BU_CDP_URL", previous_cdp), ("BU_NAME", previous_name)):
             if value is None:
                 os.environ.pop(name, None)
@@ -1802,6 +1863,221 @@ def test_run_operation_budget_and_dispatch(runner):
           json.dumps(stale_first["calls"]))
 
 
+def test_run_operation_stopping_dispatch_correlation(runner):
+    """The stopping decision's dispatch is correlated, never counted.
+
+    Every case here drives the real run_operation and the real agent loop.
+    Cases 1 and 2 have the identical count shape, one row and two decisions,
+    with the last row reading "attempted", and the honest answers differ.
+    """
+
+    def correlation(report):
+        """(rows, decisions, record) as the executor itself recorded them."""
+        state = report["calls"].get("final_state") or {}
+        return state.get("history") or [], state.get("decisions") or [], state.get("latest_dispatch")
+
+    # 1. The reported regression. A pre-input StalePage retry leaves a decision
+    # with no row, the retry then clicks, and the run stops at max_steps. The
+    # stopping decision did dispatch.
+    stale_then_click = drive_run_operation(
+        runner,
+        decisions=[safety_decision("e2"), safety_decision("e2")],
+        stale_inputs=[True], request={"max_steps": 1},
+    )
+    result = stale_then_click["result"]
+    rows, decisions, record = correlation(stale_then_click)
+    check("dispatch_correlation.stale_retry.status", result["status"] == runner.MAX_STEPS,
+          str(result["status"]))
+    check("dispatch_correlation.stale_retry.one_click_reached_the_page",
+          [a["id"] for a in stale_then_click["calls"]["acts"]] == ["e2"],
+          json.dumps(stale_then_click["calls"]["acts"]))
+    check("dispatch_correlation.stale_retry.row_says_attempted",
+          [row["dispatch"] for row in result["actions"]] == ["attempted"],
+          json.dumps(result["actions"]))
+    check("dispatch_correlation.stale_retry.handoff_says_attempted",
+          result["handoff"]["input_dispatched"] == "attempted",
+          json.dumps(result["handoff"]))
+    check("dispatch_correlation.stale_retry.side_effects_uncertain",
+          result["side_effects"] == "uncertain", str(result["side_effects"]))
+    # The row the handoff describes is the row the stopping decision produced.
+    check("dispatch_correlation.stale_retry.record_names_the_stopping_decision",
+          isinstance(record, dict)
+          and record["decision_seq"] == decisions[-1]["decision_seq"]
+          and record["decision_seq"] == rows[-1]["decision_seq"]
+          and record["dispatch"] == rows[-1]["dispatch"],
+          json.dumps({"record": record, "rows": [r.get("decision_seq") for r in rows],
+                      "decisions": [d.get("decision_seq") for d in decisions]}))
+    check("dispatch_correlation.stale_retry.the_stale_decision_made_no_row",
+          len(decisions) == 2 and len(rows) == 1
+          and decisions[0]["decision_seq"] != rows[0]["decision_seq"],
+          json.dumps({"rows": len(rows), "decisions": len(decisions)}))
+
+    # 2. The paired case the counts cannot separate. A click, then a new
+    # decision that the cost stop caught before input. Same shape, and
+    # "not_dispatched" is the honest answer here.
+    click_then_cost = drive_run_operation(
+        runner,
+        decisions=[safety_decision("e2"), safety_decision("e2")],
+        request={"max_cost_usd": 0.002}, costs={"decision": 0.0015},
+    )
+    result = click_then_cost["result"]
+    paired_rows, paired_decisions, paired_record = correlation(click_then_cost)
+    check("dispatch_correlation.cost_limit.status", result["status"] == runner.COST_LIMIT,
+          str(result["status"]))
+    check("dispatch_correlation.cost_limit.handoff_stays_not_dispatched",
+          result["handoff"]["input_dispatched"] == "not_dispatched",
+          json.dumps(result["handoff"]))
+    check("dispatch_correlation.cost_limit.the_earlier_click_is_still_reported",
+          [row["dispatch"] for row in result["actions"]] == ["attempted"]
+          and result["side_effects"] == "uncertain", json.dumps(result["actions"]))
+    check("dispatch_correlation.cost_limit.record_names_the_uncosted_decision",
+          isinstance(paired_record, dict)
+          and paired_record["decision_seq"] == paired_decisions[-1]["decision_seq"]
+          and paired_record["decision_seq"] != paired_rows[-1]["decision_seq"]
+          and paired_record["dispatch"] == "not_dispatched",
+          json.dumps({"record": paired_record,
+                      "rows": [r.get("decision_seq") for r in paired_rows]}))
+    # The two runs above are indistinguishable by count.
+    check("dispatch_correlation.the_two_cases_have_the_same_count_shape",
+          (len(rows), len(decisions), rows[-1]["dispatch"])
+          == (len(paired_rows), len(paired_decisions), paired_rows[-1]["dispatch"]),
+          json.dumps({"stale_retry": [len(rows), len(decisions), rows[-1]["dispatch"]],
+                      "cost_limit": [len(paired_rows), len(paired_decisions),
+                                     paired_rows[-1]["dispatch"]]}))
+    check("dispatch_correlation.the_two_cases_report_different_answers",
+          stale_then_click["result"]["handoff"]["input_dispatched"] == "attempted"
+          and click_then_cost["result"]["handoff"]["input_dispatched"] == "not_dispatched")
+
+    # 3. An uncosted second decision stops before input for the same reason.
+    click_then_uncosted = drive_run_operation(
+        runner,
+        decisions=[safety_decision("e2"), safety_decision("e2")],
+        decision_costs=[0.001, None],
+    )
+    result = click_then_uncosted["result"]
+    check("dispatch_correlation.cost_unknown.status", result["status"] == runner.COST_UNKNOWN,
+          str(result["status"]))
+    check("dispatch_correlation.cost_unknown.handoff_not_dispatched",
+          result["handoff"]["input_dispatched"] == "not_dispatched"
+          and [row["dispatch"] for row in result["actions"]] == ["attempted"],
+          json.dumps(result["handoff"]))
+
+    # 4. A withheld second decision after a dispatched first one.
+    click_then_withheld = drive_run_operation(
+        runner,
+        decisions=[safety_decision("e2", confidence=0.95, target_confidence=0.95),
+                   safety_decision("e2", confidence=0.1, target_confidence=0.95)],
+        confidence={"operation": 0.8},
+    )
+    result = click_then_withheld["result"]
+    withheld_rows, withheld_decisions, withheld_record = correlation(click_then_withheld)
+    check("dispatch_correlation.low_confidence_second.status",
+          result["status"] == runner.NEEDS_REVIEW, str(result["status"]))
+    check("dispatch_correlation.low_confidence_second.handoff_not_dispatched",
+          result["handoff"]["input_dispatched"] == "not_dispatched",
+          json.dumps(result["handoff"]))
+    check("dispatch_correlation.low_confidence_second.rows_keep_both_decisions",
+          [row["dispatch"] for row in result["actions"]] == ["attempted", "not_dispatched"],
+          json.dumps(result["actions"]))
+    check("dispatch_correlation.low_confidence_second.record_matches_the_withheld_row",
+          isinstance(withheld_record, dict)
+          and withheld_record["decision_seq"] == withheld_decisions[-1]["decision_seq"]
+          and withheld_record["decision_seq"] == withheld_rows[-1]["decision_seq"]
+          and withheld_record["dispatch"] == "not_dispatched",
+          json.dumps({"record": withheld_record,
+                      "rows": [r.get("decision_seq") for r in withheld_rows]}))
+
+    # 5. Two freshness failures in a row send nothing at all.
+    repeated_stale = drive_run_operation(
+        runner,
+        decisions=[safety_decision("e2"), safety_decision("e2")],
+        stale_inputs=[True, True], decision_costs=[0.001, None],
+    )
+    result = repeated_stale["result"]
+    stale_rows, stale_decisions, stale_record = correlation(repeated_stale)
+    check("dispatch_correlation.repeated_stale.no_input_reached_the_page",
+          repeated_stale["calls"]["acts"] == [] and result["actions"] == [],
+          json.dumps(repeated_stale["calls"]["acts"]))
+    check("dispatch_correlation.repeated_stale.none_observed_and_not_dispatched",
+          result["side_effects"] == "none_observed"
+          and result["handoff"]["input_dispatched"] == "not_dispatched",
+          json.dumps({"side_effects": result["side_effects"], "handoff": result["handoff"]}))
+    check("dispatch_correlation.repeated_stale.two_decisions_no_rows",
+          len(stale_decisions) == 2 and stale_rows == []
+          and stale_record["decision_seq"] == stale_decisions[-1]["decision_seq"],
+          json.dumps({"decisions": len(stale_decisions), "rows": len(stale_rows)}))
+
+    # 6. An interrupted select stays unknown and is never replayed.
+    interrupted = drive_run_operation(
+        runner, decisions=[safety_decision("e2")],
+        act_error=RuntimeError("Dropdown execution was interrupted; inspect before retrying."),
+    )
+    result = interrupted["result"]
+    _, interrupted_decisions, interrupted_record = correlation(interrupted)
+    check("dispatch_correlation.interrupted.unknown_is_not_downgraded",
+          result["handoff"]["input_dispatched"] == "unknown"
+          and [row["dispatch"] for row in result["actions"]] == ["unknown"]
+          and result["side_effects"] == "uncertain", json.dumps(result["handoff"]))
+    check("dispatch_correlation.interrupted.one_attempt_only",
+          len(interrupted["calls"]["acts"]) == 1 and interrupted["calls"]["choose"] == 1,
+          json.dumps(interrupted["calls"]))
+    check("dispatch_correlation.interrupted.record_is_unknown",
+          interrupted_record["dispatch"] == "unknown"
+          and interrupted_record["decision_seq"] == interrupted_decisions[-1]["decision_seq"],
+          json.dumps(interrupted_record))
+
+    # 7. The read after input failed. The dispatched input must survive it.
+    import jev_ultrafast.agent as agent_module
+
+    stale_after_input = drive_run_operation(
+        runner, decisions=[safety_decision("e2")],
+        observe_errors=[None, agent_module.StalePage("Page changed after input.")],
+    )
+    result = stale_after_input["result"]
+    _, _, after_record = correlation(stale_after_input)
+    check("dispatch_correlation.stale_after_input.status",
+          result["status"] == runner.NEEDS_REVIEW, str(result["status"]))
+    check("dispatch_correlation.stale_after_input.attempted_survives",
+          result["handoff"]["input_dispatched"] == "attempted"
+          and [row["dispatch"] for row in result["actions"]] == ["attempted"]
+          and result["side_effects"] == "uncertain", json.dumps(result["handoff"]))
+    check("dispatch_correlation.stale_after_input.record_is_attempted",
+          after_record["dispatch"] == "attempted", json.dumps(after_record))
+
+    # A non-StalePage read failure after input keeps the same uncertainty. Its
+    # status is the separate post-input observe question and is unchanged here.
+    broken_after_input = drive_run_operation(
+        runner, decisions=[safety_decision("e2")],
+        observe_errors=[None, RuntimeError("CDP transport died mid-observe")],
+    )
+    result = broken_after_input["result"]
+    _, _, broken_record = correlation(broken_after_input)
+    check("dispatch_correlation.observe_error.uncertainty_is_kept",
+          result["handoff"]["input_dispatched"] == "unknown"
+          and [row["dispatch"] for row in result["actions"]] == ["attempted"]
+          and result["side_effects"] == "uncertain",
+          json.dumps({"handoff": result["handoff"], "actions": result["actions"]}))
+    check("dispatch_correlation.observe_error.record_still_says_attempted",
+          broken_record["dispatch"] == "attempted", json.dumps(broken_record))
+
+    # 8. A run that stops on its own decision, with no retry anywhere, still
+    # reports the row it stopped on.
+    plain_max_steps = drive_run_operation(
+        runner, decisions=[safety_decision("e2"), safety_decision("e2")],
+        request={"max_steps": 1},
+    )
+    result = plain_max_steps["result"]
+    plain_rows, plain_decisions, plain_record = correlation(plain_max_steps)
+    check("dispatch_correlation.control.attempted",
+          result["status"] == runner.MAX_STEPS
+          and result["handoff"]["input_dispatched"] == "attempted",
+          json.dumps(result["handoff"]))
+    check("dispatch_correlation.control.one_decision_one_row",
+          len(plain_decisions) == 1 and len(plain_rows) == 1
+          and plain_record["decision_seq"] == plain_rows[-1]["decision_seq"],
+          json.dumps({"decisions": len(plain_decisions), "rows": len(plain_rows)}))
+
+
 def test_run_operation_truncated_completion(runner):
     """A DONE on truncated evidence is only a completion when the checks pass."""
     truncated = safety_page(text_truncated=True, omitted_actions=12)
@@ -2007,6 +2283,7 @@ UNIT_TESTS = [
     test_needs_review_status,
     test_run_operation_confidence_gates,
     test_run_operation_budget_and_dispatch,
+    test_run_operation_stopping_dispatch_correlation,
     test_run_operation_truncated_completion,
     test_run_operation_live_observation,
     test_group_scan_excludes_itself,

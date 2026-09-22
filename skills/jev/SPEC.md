@@ -82,6 +82,14 @@ Python 3.12 while Prime Agent kernels may use 3.11. Do not install upstream into
   passing freshness check; it is not a claim about a server. Any dispatched or
   interrupted input makes the whole run `uncertain`. A freshness failure before input
   dispatched nothing and stays a safe re-observation, never an uncertain input.
+- `handoff["input_dispatched"]` names what the decision the run stopped on sent, and it
+  is correlated, never counted. The executor records the answer for the decision it is
+  executing before every step that can raise, and names that decision with a monotonic
+  internal id the decision record and its history row both carry. Row counts cannot
+  answer it: a pre-input `StalePage` consumes a decision without recording a row, so one
+  row fewer than decisions describes a dispatched click followed by a budget stop on a
+  later decision exactly as it describes a run that sent nothing. A record that is
+  missing or names another decision reads `unknown`, never `not_dispatched`.
 - `result["handoff"]` is an allowlist: reason, choice, operation, target, the three
   scores, binding key, the observation, `input_dispatched` and the fixed
   `resume_policy` string. No task, values, labels, previews, page text, screenshots,
@@ -130,7 +138,10 @@ the other scores alone; the same low scores typing normally with no policy; a va
 an invalid policy rejected identically in the wrapper and in the runner; an uncosted or
 over-budget decision, bind or helper call stopping before input; an interrupted
 `Browser.act` recorded as `dispatch="unknown"` and `needs_review`; a pre-input
-`StalePage` re-observed without becoming an uncertain input; DONE on truncated evidence
+`StalePage` re-observed without becoming an uncertain input; that same `StalePage`
+followed by a dispatched click and a `max_steps` stop reported as `attempted`, paired
+with a budget stop on a newer decision that leaves the identical row and decision counts
+and is still reported as `not_dispatched`; DONE on truncated evidence
 with no declared check reported `needs_review`; the same DONE accepted only when every
 declared check passed and refused when they failed or could not be read; a truncated
 page still accepting a click; a click, fill or select whose target field is missing

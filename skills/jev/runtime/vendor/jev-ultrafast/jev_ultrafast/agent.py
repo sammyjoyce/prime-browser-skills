@@ -121,6 +121,11 @@ class Agent:
             plan=plan,
             plan_index=0,
             decisions=[],
+            # Correlation between the decision the run stops on and what that
+            # decision sent. See _mark_dispatch. decision_seq is monotonic and
+            # internal: never len(decisions), never a page fingerprint.
+            decision_seq=0,
+            latest_dispatch=None,
             text_calls=[],
             bind_calls=[],
             elapsed_ms=0,
@@ -135,6 +140,24 @@ class Agent:
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
             "elements": action_space(self.state["page"]["actions"])[0],
+        }
+
+    def _mark_dispatch(self, dispatch):
+        """Record what the decision now being executed sent.
+
+        Correlation invariant: ``state["latest_dispatch"]`` always describes
+        the most recent decision ``predict`` produced, and names it with the
+        same ``decision_seq`` the history row for that decision carries.
+        Counting rows cannot answer this. A pre-input StalePage consumes a
+        decision and appends no row, so one row fewer than decisions describes
+        both a later dispatched click and a budget stop that sent nothing.
+
+        Written before every step that can raise, so a stop between CDP input
+        and the history row still reports the input.
+        """
+        self.state["latest_dispatch"] = {
+            "decision_seq": self.state.get("decision_seq"),
+            "dispatch": dispatch,
         }
 
     def _check_budget(self):
@@ -221,6 +244,9 @@ class Agent:
         probabilities = decision.get("probabilities") or {}
         return {
             "step": len(state["history"]) + 1,
+            # Which decision this row executed. Internal: the runner reports
+            # rows through its own allowlist and never exports this.
+            "decision_seq": state.get("decision_seq"),
             "action": label,
             "kind": kind,
             "choice": selected,
@@ -348,13 +374,21 @@ class Agent:
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
             state["decision"] = choose(state["page"], state["goal"], state["history"], values=self.values)
+            # Assigned before the decision is recorded, so it never reads the
+            # length of a list this decision has not been appended to yet.
+            seq = (state.get("decision_seq") or 0) + 1
+            state["decision_seq"] = seq
             state["decisions"].append(
                 {
                     **state["decision"],
+                    "decision_seq": seq,
                     "fingerprint": state["page"]["fingerprint"],
                     "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
                 }
             )
+            # Durable before _check_budget, which may raise: a decision that has
+            # only been predicted has dispatched nothing.
+            self._mark_dispatch("not_dispatched")
             state["status"] = "predicted"
             self._check_budget()
         elif name == "act":
@@ -442,8 +476,9 @@ class Agent:
                 except Exception as exc:
                     # After a passing freshness check, a generic exception does not prove
                     # nothing was sent. Select interruption is the named case.
-                    self.pending_text = None
                     dispatch = "unknown"
+                    self._mark_dispatch(dispatch)
+                    self.pending_text = None
                     state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                     state["history"].append(
                         self._history_row(
@@ -469,6 +504,9 @@ class Agent:
                         binding_confidence=binding_confidence,
                     ) from exc
                 dispatch = "not_dispatched" if action["kind"] == "wait" else "attempted"
+                # Input has already been sent. Record that before the history
+                # row, the screenshot or anything else that can raise.
+                self._mark_dispatch(dispatch)
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.

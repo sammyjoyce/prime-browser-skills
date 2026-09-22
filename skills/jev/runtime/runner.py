@@ -1619,24 +1619,42 @@ def side_effects_of(history):
     return NONE_OBSERVED
 
 
+LATEST_DISPATCH = "latest_dispatch"
+DECISION_SEQ = "decision_seq"
+
+
 def stopping_dispatch(final_state):
     """Was input dispatched for the decision this run stopped on?
 
-    A history row is appended only after a decision was consumed, so a decision
-    that dispatched nothing (DONE, a withhold, a budget stop, or a pre-input
-    StalePage, which browser.py raises before any CDP input) leaves fewer rows
-    than decisions. When the counts cannot be read the answer is "unknown",
-    never "not_dispatched": a missing row is not proof that nothing was sent.
+    The executor answers this itself. It records what the decision it is
+    executing has sent in ``latest_dispatch``, before every step that can
+    raise, and names that decision with the same monotonic ``decision_seq``
+    the decision record and its history row carry. This function only reads
+    that record, and only after checking it describes the last decision.
+
+    Row counts cannot answer it. A pre-input StalePage consumes a decision and
+    appends no row, because browser.py raises before any CDP input, so "one
+    row fewer than decisions" describes a dispatched click followed by a
+    budget stop on a later decision exactly as it describes a run that sent
+    nothing at all.
+
+    When the record is missing, unreadable, or describes some other decision,
+    the answer is "unknown", never "not_dispatched": an unreadable record is
+    not proof that nothing was sent.
     """
     if not isinstance(final_state, dict):
         return UNKNOWN_DISPATCH
-    history = final_state.get("history")
     decisions = final_state.get("decisions")
-    if not isinstance(history, list) or not isinstance(decisions, list):
+    record = final_state.get(LATEST_DISPATCH)
+    if not isinstance(decisions, list) or not decisions or not isinstance(record, dict):
         return UNKNOWN_DISPATCH
-    if not history or len(history) < len(decisions):
-        return NOT_DISPATCHED
-    value = history[-1].get("dispatch") if isinstance(history[-1], dict) else None
+    seq = record.get(DECISION_SEQ)
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
+        return UNKNOWN_DISPATCH
+    last = decisions[-1]
+    if not isinstance(last, dict) or last.get(DECISION_SEQ) != seq:
+        return UNKNOWN_DISPATCH
+    value = record.get("dispatch")
     return value if value in DISPATCH_VALUES else UNKNOWN_DISPATCH
 
 

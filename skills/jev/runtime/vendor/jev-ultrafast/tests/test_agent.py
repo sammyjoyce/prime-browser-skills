@@ -1193,6 +1193,86 @@ def test_select_interruption_is_needs_review_with_unknown_dispatch(runner):
     assert runner.state["history"]
 
 
+def test_each_decision_carries_its_own_dispatch_record(runner, monkeypatch):
+    """latest_dispatch follows the decision being executed, not the row count."""
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
+    runner.state["decision"] = None
+    runner.state["status"] = "ready"
+    runner.command("predict")
+    first = runner.state["decisions"][-1]["decision_seq"]
+    assert first == 1
+    assert runner.state["latest_dispatch"] == {"decision_seq": first,
+                                               "dispatch": "not_dispatched"}
+    act(runner)
+    assert runner.state["latest_dispatch"] == {"decision_seq": first, "dispatch": "attempted"}
+    assert runner.state["history"][-1]["decision_seq"] == first
+
+    # A pre-input StalePage consumes the next decision and records no row. The
+    # record must move to that decision and say nothing was sent for it, while
+    # the dispatched row of the previous decision stays exactly as it was.
+    runner.state["status"] = "ready"
+    runner.command("predict")
+    second = runner.state["decisions"][-1]["decision_seq"]
+    assert second == first + 1
+    runner.state["browser"].act.side_effect = StalePage("changed")
+    with pytest.raises(StalePage):
+        act(runner)
+    assert runner.state["latest_dispatch"] == {"decision_seq": second,
+                                               "dispatch": "not_dispatched"}
+    assert len(runner.state["history"]) == 1
+    assert runner.state["history"][-1]["decision_seq"] == first
+    assert runner.state["history"][-1]["dispatch"] == "attempted"
+
+
+def test_predict_does_not_write_the_sequence_onto_the_decision_it_was_given(runner, monkeypatch):
+    """The id is assigned, not stamped onto the provider's own dict."""
+    supplied = decision("e3")
+    monkeypatch.setattr(loop, "choose", Mock(return_value=supplied))
+    runner.state["decision"] = None
+    runner.state["status"] = "ready"
+    runner.command("predict")
+    assert "decision_seq" not in supplied
+    assert runner.state["decisions"][-1]["decision_seq"] == 1
+
+
+def test_dispatch_record_names_no_decision_when_none_was_predicted(runner):
+    """A state assembled without predict records what was sent and invents no id.
+
+    The runtime reads that as unclassifiable and reports "unknown". It must
+    never read as a promise that nothing was sent.
+    """
+    runner.state["decision"] = decision("e3")
+    act(runner)
+    assert runner.state["latest_dispatch"] == {"decision_seq": None, "dispatch": "attempted"}
+    assert runner.state["history"][-1]["decision_seq"] is None
+
+
+def test_interrupted_input_records_unknown_before_the_history_row(runner):
+    """The record is durable even if the bookkeeping after input cannot run."""
+    runner.state["decision"] = decision("e3")
+    runner.state["browser"].act.side_effect = RuntimeError("interrupted")
+    with pytest.raises(NeedsReview):
+        act(runner)
+    assert runner.state["latest_dispatch"]["dispatch"] == "unknown"
+    assert runner.state["history"][-1]["dispatch"] == "unknown"
+
+
+def test_wait_records_not_dispatched_in_the_decision_record(runner):
+    runner.state["decision"] = decision("wait")
+    act(runner)
+    assert runner.state["latest_dispatch"]["dispatch"] == "not_dispatched"
+    assert runner.state["history"][-1]["dispatch"] == "not_dispatched"
+
+
+def test_stale_observation_after_input_keeps_the_dispatched_record(runner):
+    runner.state["decision"] = decision("e3")
+    runner.state["browser"].observe.side_effect = StalePage("changed")
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.input_dispatched == "attempted"
+    assert runner.state["latest_dispatch"]["dispatch"] == "attempted"
+
+
 def test_tick_does_not_retry_an_unknown_dispatch(runner, monkeypatch):
     monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
     runner.state["decision"] = None
