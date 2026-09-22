@@ -113,6 +113,47 @@ CONTRACT_CASES = [
 ]
 
 
+# Same idea for the confidence-cutoff contract: the runtime must load the
+# wrapper's own file and reject the same policies with the same messages.
+CONFIDENCE_PROBE_SOURCE = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import runner
+
+request = {"op": "run", "task": "t", "url": "http://127.0.0.1:9/",
+           "profile_dir": "/tmp/jev-contract-probe", "artifact_dir": "/tmp/jev-contract-probe"}
+report = {"file": runner.confidence_policy_contract.__file__, "results": []}
+for policy in json.loads(sys.stdin.read()):
+    try:
+        report["results"].append(
+            {"ok": True, "confidence": runner.normalize(dict(request, confidence=policy))["confidence"]}
+        )
+    except runner.RequestError as exc:
+        report["results"].append({"ok": False, "error": str(exc)})
+report["login_has_no_cutoff"] = runner.normalize(
+    {"op": "login", "url": "http://127.0.0.1:9/", "profile_dir": "/tmp/jev-contract-probe",
+     "artifact_dir": "/tmp/jev-contract-probe", "confidence": {"operation": 0.8}}
+)["confidence"]
+sys.stdout.write(json.dumps(report))
+"""
+
+CONFIDENCE_CASES = [
+    None,
+    {},
+    {"operation": 1.0},
+    {"operation": 0.8, "target": 0.85, "binding": 0.9},
+    {"operation": 0},
+    {"operation": 1.1},
+    {"operation": True},
+    {"operation": "0.8"},
+    {"operation": None},
+    {"op": 0.8},
+    {"": 0.8},
+    [],
+    0.8,
+]
+
+
 def wait_pid_dead(pid, timeout=DEAD_WAIT_S):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -285,6 +326,38 @@ class RuntimeLaunchTests(unittest.TestCase):
                             row["fingerprint"],
                             jev.checks.declaration_fingerprint(
                                 jev._validate_checks(checks)[0]))
+
+    def test_runtime_validates_confidence_with_the_wrapper_contract(self):
+        """One cutoff contract file, loaded by both boundaries, case by case.
+
+        No browser, no key, no model call: the probe imports the runner and
+        calls normalize() only.
+        """
+        with tempfile.TemporaryDirectory(prefix="jev-confidence-") as tmp:
+            probe = Path(tmp) / "confidence_probe.py"
+            probe.write_text(CONFIDENCE_PROBE_SOURCE)
+            completed = subprocess.run(
+                [str(jev._runtime_python()), str(probe), str(jev._runtime_dir())],
+                input=json.dumps(CONFIDENCE_CASES),
+                capture_output=True, text=True, timeout=120, env=jev._child_env(),
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+        report = json.loads(completed.stdout)
+        self.assertEqual(Path(report["file"]).resolve(),
+                         Path(jev.confidence.__file__).resolve(),
+                         "the runtime must load the wrapper's own cutoff contract")
+        self.assertIsNone(report["login_has_no_cutoff"], "login gates nothing")
+        self.assertEqual(len(report["results"]), len(CONFIDENCE_CASES))
+        for case, outcome in zip(CONFIDENCE_CASES, report["results"]):
+            with self.subTest(case=repr(case)[:60]):
+                if outcome["ok"]:
+                    self.assertEqual(outcome["confidence"], jev._validate_confidence(case),
+                                     "both boundaries must normalize identically")
+                else:
+                    with self.assertRaises(jev.JevValidationError) as ctx:
+                        jev._validate_confidence(case)
+                    self.assertEqual(ctx.exception.message, outcome["error"],
+                                     "both boundaries must reject with the same message")
 
     def test_run_without_a_key_fails_typed_before_any_model_call(self):
         """No key means no browser and no provider request, twice in a row.

@@ -80,6 +80,15 @@ def action_space(actions):
     return elements, targets, controls
 
 
+def observation_payload(page):
+    """Flags the decision model can see. Missing snapshot keys are not truncated."""
+    return {
+        "omitted_actions": int(page.get("omitted_actions") or 0),
+        "text_truncated": bool(page.get("text_truncated")),
+        "viewport": {"w": page.get("w"), "h": page.get("h")},
+    }
+
+
 def choose(state, goal, history, values=None):
     elements, targets, controls = action_space(state["actions"])
     typed_text = (
@@ -114,6 +123,7 @@ def choose(state, goal, history, values=None):
         }
     request_state = {
         "page": {k: state[k] for k in ("url", "title", "text")},
+        "observation": observation_payload(state),
         "elements": elements,
         "recent_actions": [{k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]],
     }
@@ -180,6 +190,7 @@ def bind_value(goal, action, page, history, values):
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
             "page": {"url": page["url"], "title": page["title"], "text": page["text"][:6000]},
+            "observation": observation_payload(page),
             "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
         },
         "questions": {

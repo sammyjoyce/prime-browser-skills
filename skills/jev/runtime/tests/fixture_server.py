@@ -25,6 +25,18 @@ document.getElementById("state").textContent = had ? "storage present" : "storag
 """
 
 
+# Static, minimal page for the snapshot guard group. The group replaces the
+# body itself for each truncation case, so the served page only has to be a
+# real document from a real origin (a data: URL is not one).
+SNAPSHOT_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Jev snapshot fixture</title></head>
+<body>
+<h1 id="heading">Snapshot fixture</h1>
+<p id="body">Short visible text.</p>
+</body></html>
+"""
+
+
 # Static, deterministic page for declared DOM checks. It counts the events a
 # mutation would produce, so a test can prove the checks only read.
 CHECKS_PAGE = """<!doctype html>
@@ -88,6 +100,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         state = Handler.state
+        if self.path.startswith("/snapshot"):
+            self._send(200, SNAPSHOT_PAGE)
+            return
         if self.path.startswith("/checks"):
             # Static: no cookie, no counter, so a re-read is always identical.
             self._send(200, CHECKS_PAGE)

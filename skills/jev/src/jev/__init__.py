@@ -3,7 +3,8 @@ jev-ultrafast agent, through a separate Python 3.12 runtime project.
 
     result = await jev.run(task, url, profile="default", max_steps=25,
                            timeout_ms=120_000, max_cost_usd=0.5,
-                           values=None, generation=None, checks=None)
+                           values=None, generation=None, checks=None,
+                           confidence=None)
     result = await jev.login(profile="default", url="https://example.com",
                              timeout_ms=600_000)
 
@@ -86,20 +87,62 @@ and to "helper" otherwise. Each entry in result["actions"] reports value_key
 and value_source ("supplied", "helper", "skipped" or null); the text that was
 typed is never returned.
 
+Confidence cutoffs: confidence={"operation": 0.8, "binding": 0.9} withholds
+the next input when the executor's own score for that choice is below the
+cutoff. The three gates ("operation", "target", "binding") are independent and
+optional; each value is a finite number in (0, 1]. These are caller policy
+numbers, not calibrated probabilities of success, and this package ships no
+default: None and {} both mean "record the scores and withhold nothing". A
+withheld step dispatches nothing, is recorded with dispatch "not_dispatched",
+and ends the run with status "needs_review". A high score never grants
+authority: generation="disabled", freshness, the skip-when-unbound rule, the
+cost stop and the truncated-DONE rule all still apply.
+
+Every action row also reports operation_confidence, target_confidence
+(null when the operation has no target), binding_confidence (null when no
+bind ran) and dispatch ("not_dispatched", "attempted" or "unknown").
+
 Result dict, always with the same keys: status ("completed" on success),
 output, text, steps, cost (None means unknown, never a fake 0.0; a completed
 login is 0 because it makes no model call), cost_detail, usage, model,
 resolved_model, helper_model, duration_ms, stop_reason, warnings,
 screenshot_path (run: an existing absolute PNG; login: always None),
 verification (run: the declared-check object above, "not_run" when no check
-was declared; login: None), artifact_dir, profile_dir, stderr_path. A
-completed run's output carries final_url, final_title, page_text,
-completion_claimed and verification; a completed login's output carries
-authenticated (always None) and verification.
+was declared; login: None), observation, side_effects, handoff,
+confidence_policy, artifact_dir, profile_dir, stderr_path. A completed run's
+output carries final_url, final_title, page_text, completion_claimed and
+verification; a completed login's output carries authenticated (always None)
+and verification.
+
+observation describes the last page the executor saw: omitted_actions (how
+many in-viewport controls the 250 cap dropped), text_truncated (whether the
+6000-character visible-text cap cut the page), viewport and fingerprint. It
+never carries page text or element values.
+
+side_effects is "none_observed" or "uncertain" and never "confirmed". It is
+not a persistence claim: "none_observed" says no click, fill, select or scroll
+reached the page after a passing freshness check, not that nothing happened on
+a server, because a navigation alone can call an endpoint. Any dispatched or
+interrupted input makes the whole run "uncertain", including a fill whose
+value reads back correctly.
+
+handoff is an allowlisted record of the unresolved decision the executor
+stopped on, for a parent model: reason, choice, operation, target, the same
+scores, binding_key, the observation, input_dispatched and a resume_policy that
+says to inspect the current state and never replay the decision or any
+uncertain input. It is null when there is no such decision to describe: a
+completed run, a failure that stopped before the agent observed a page, or a
+DONE that later failed only at screenshot capture or cleanup. A later capture
+or cleanup failure does not invent a withheld decision after DONE. It carries
+no task, no supplied value, no label, no page text, no screenshot and no
+browser session id, and it is not a resumable session.
+
 Every non-completed status raises instead of returning:
 JevError(status, message, result), plus JevValidationError (bad arguments,
 also a ValueError), JevTimeoutError, JevProtocolError (the runner broke the
-result contract) and JevProfileInUseError.
+result contract) and JevProfileInUseError. status "needs_review" means the
+executor withheld the next input; read error.result["handoff"], inspect the
+page and do not replay the decision.
 
 Storage (JEV_HOME overrides, default ~/.prime/agent/jev), directories 0700
 and files 0600: profiles/<profile>/ is the dedicated Chrome user-data-dir and
@@ -169,6 +212,8 @@ from .checks import NOTE as CHECK_NOTE
 from .checks import ROW_STATUSES as CHECK_ROW_STATUSES
 from .checks import SCOPE as CHECK_SCOPE
 from .checks import STATUSES as CHECK_STATUSES
+from .confidence import GATES as CONFIDENCE_GATES
+from .confidence import ConfidenceError, normalize_confidence
 
 try:
     import fcntl
@@ -190,6 +235,8 @@ __all__ = [
     "CHECK_SCOPE",
     "CHECK_BOUNDARY",
     "CHECK_STATUSES",
+    "CONFIDENCE_GATES",
+    "SIDE_EFFECTS",
 ]
 
 DEFAULT_HOME = "~/.prime/agent/jev"
@@ -216,6 +263,9 @@ _MAX_COST_USD = 100.0
 _MAX_VALUES = 20
 _MAX_VALUE_CHARS = 2_000
 _GENERATION = ("helper", "disabled")
+# Everything this wrapper will accept in result["side_effects"]. "confirmed" is
+# not one of them: nothing in a browser DOM proves a server stored anything.
+SIDE_EFFECTS = ("none_observed", "uncertain")
 
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _VALUE_KEY_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9_]{0,63}\Z")
@@ -392,6 +442,20 @@ def _validate_checks(value: Any) -> list:
     try:
         return normalize_checks(value)
     except CheckError as exc:
+        _invalid(str(exc))
+
+
+def _validate_confidence(value: Any) -> dict | None:
+    """Optional confidence cutoffs, normalized, or None. Rejected before launch.
+
+    The contract lives in jev/confidence.py and the runtime re-validates the
+    same request with the same function, so the two boundaries cannot drift.
+    A cutoff is a caller policy, never a calibrated success rate, and there is
+    no default: None and {} both mean "record the scores, withhold nothing".
+    """
+    try:
+        return normalize_confidence(value)
+    except ConfidenceError as exc:
         _invalid(str(exc))
 
 
@@ -686,6 +750,13 @@ def _base_result(status: Any, artifact_dir: Path, profile_dir: Path, stderr_path
         # Wrapper-generated failures fill this via _verification_before_read;
         # parsed runner payloads overwrite it. Login keeps None.
         "verification": None,
+        # Safety metadata: the last observation's truncation and viewport
+        # flags, whether any input reached the page, what a parent model may
+        # read before re-planning, and the cutoff policy that was applied.
+        "observation": None,
+        "side_effects": None,
+        "handoff": None,
+        "confidence_policy": None,
         "artifact_dir": str(artifact_dir),
         "profile_dir": str(profile_dir),
         "stderr_path": str(stderr_path),
@@ -726,6 +797,13 @@ _FIELD_RULES = {
     "helper_model": (lambda v: isinstance(v, str), "a string"),
     "stop_reason": (lambda v: isinstance(v, str), "a string"),
     "verification": (lambda v: isinstance(v, dict), "an object"),
+    # Safety metadata. Shape only: the honesty rules that matter are that
+    # side_effects can never say "confirmed" and that a completed run carries
+    # no handoff, both enforced below.
+    "side_effects": (lambda v: v in SIDE_EFFECTS, "'none_observed' or 'uncertain'"),
+    "observation": (lambda v: isinstance(v, dict), "an object"),
+    "handoff": (lambda v: isinstance(v, dict), "an object"),
+    "confidence_policy": (lambda v: isinstance(v, dict), "an object"),
 }
 
 
@@ -1000,6 +1078,11 @@ def _check_completed(op: str, obj: dict, result: dict, protocol_error) -> None:
             f"output.verification must be {VERIFICATION!r}, got {verification!r}"
         )
     output["verification"] = VERIFICATION
+    # A handoff exists so a caller can inspect before re-planning. A completed
+    # run has nothing to hand off, so a runner that returns one contradicts its
+    # own status.
+    if result.get("handoff") is not None:
+        protocol_error("a completed result must not carry a handoff")
 
     if op == "login":
         # login opens a headed window only: no model call, no step, no capture.
@@ -1076,6 +1159,7 @@ async def _invoke_runner(
     values: dict | None = None,
     generation: str | None = None,
     checks: list | None = None,
+    confidence: dict | None = None,
 ) -> dict:
     home = _home_dir()
     profiles_root = home / "profiles"
@@ -1126,6 +1210,7 @@ async def _invoke_runner(
                 request["generation"] = generation
                 # Already normalized and bounded; the runner validates it again.
                 request["checks"] = checks or []
+                request["confidence"] = confidence
 
             fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             stderr_fh = os.fdopen(fd, "wb")
@@ -1207,6 +1292,7 @@ async def run(
     values: dict | None = None,
     generation: str | None = None,
     checks: list | None = None,
+    confidence: dict | None = None,
 ) -> dict:
     """Run one agentic browser task from url; see the module docstring.
 
@@ -1231,6 +1317,16 @@ async def run(
     change nothing else: status stays an executor claim, and
     output["verification"] stays "not_performed". See the module docstring for
     the check schema and the evidence limits.
+
+    confidence is an optional dict of cutoffs for the independent "operation",
+    "target" and "binding" gates, each a finite number in (0, 1]. It is a
+    caller policy, not a calibrated success rate: below a declared cutoff the
+    executor withholds the input, records the step with dispatch
+    "not_dispatched" and stops with status "needs_review", carrying
+    result["handoff"]. None and {} both record the scores and withhold nothing,
+    and there is no default cutoff. A cutoff cannot grant authority:
+    generation="disabled", freshness, the skip-when-unbound rule and the cost
+    stop all still apply.
     """
     task = _validate_task(task)
     url = _validate_url(url)
@@ -1241,9 +1337,10 @@ async def run(
     values = _validate_values(values)
     generation = _validate_generation(generation, values)
     checks = _validate_checks(checks)
+    confidence = _validate_confidence(confidence)
     return await _invoke_runner(
         "run", task, url, profile, max_steps, timeout_ms, max_cost_usd, values, generation,
-        checks,
+        checks, confidence,
     )
 
 

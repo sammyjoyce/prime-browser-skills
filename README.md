@@ -148,9 +148,27 @@ evidence is not proof that a server stored anything. Your declaration is not ech
 back: each row carries the SHA-256 `fingerprint` of the check it answers, and a result
 whose ordered fingerprints are not the declared ones raises `jev.JevProtocolError`.
 
+`jev.run` also takes `confidence`, an optional dict of cutoffs for three independent
+gates. The numbers are illustrative, not a recommendation: they are caller policy, and
+there is no default:
+
+```python
+result = await jev.run(task, url=start_url, profile="work",
+                       confidence={"operation": 0.8, "target": 0.85, "binding": 0.9})
+```
+
+Below a declared cutoff Jev withholds the input, dispatches nothing, and stops with
+status `needs_review`, which raises `jev.JevError` carrying the partial result. Read
+`error.result["handoff"]` for the allowlisted record of what it was about to do, and
+`error.result["side_effects"]` for `"none_observed"` or `"uncertain"`, which is never
+`"confirmed"`. `result["observation"]` reports whether the page's visible text or its
+action list was truncated. Inspect the page; never replay the decision.
+
 A completed status means the executor claimed the task was done, the screenshot was
 saved, and cleanup succeeded. It is not independent proof. Check the real postcondition,
-and for writes check the saved state rather than a success message.
+and for writes check the saved state rather than a success message. A DONE claimed on a
+truncated observation is not accepted as completed unless declared DOM checks were run
+and every one of them passed.
 
 Every non-completed status raises a typed error that keeps the real provider message and
 any partial result.
@@ -185,9 +203,10 @@ Chrome user-data directory.
   in the observed field value and recent actions, and to the text helper when
   `generation="helper"` runs. Never put a credential or private data in `values`.
 - Native iOS and Android apps are out of scope for both skills.
-- Cost limits are soft. They are checked once per action, so a run can overshoot by the
-  requests of one action. One fill action can issue up to three requests: the decision
-  call, the bind call and the helper call. Missing usage data is unknown, never free.
+- Cost limits are soft. Jev now checks the budget after every model call and before any
+  input, so an uncosted or over-budget call cannot bind a value, call the text helper or
+  type; what can still overshoot is the one request already in flight, including the
+  retries the client makes inside it. Missing usage data is unknown, never free.
 - A natural-language prohibition in a task is not a sandbox. Page content can be hostile,
   and browser-driven JavaScript has host filesystem and network access. Use an isolated
   machine for untrusted browsing.
@@ -214,13 +233,19 @@ python3 -m unittest discover -s tests -v
 ```
 
 The last command tests `install.py` and needs no browser and no dependency install.
-The Jev runtime suite also takes `--group checks`, `--group browser` and
-`--group login`. All three start a real Chrome and still make no model call; only
-`checks` is headless, and it exercises the declared DOM checks against a local fixture:
+The Jev runtime suite also takes `--group checks`, `--group guards`, `--group browser`
+and `--group login`. All four start a real Chrome and still make no model call.
+`checks` and `guards` are headless, on a throwaway profile with a private
+browser-harness daemon: `checks` exercises the declared DOM checks against a local
+fixture, and `guards` measures the snapshot's truncation and action-cap metadata:
 
 ```sh
 uv run --project skills/jev/runtime --frozen python skills/jev/runtime/tests/run_tests.py --group checks
+uv run --project skills/jev/runtime --frozen python skills/jev/runtime/tests/run_tests.py --group guards
 ```
+
+Add `--reinstall-package jev-ultrafast` to the `uv sync` line after any change to the
+vendored tree; the runtime installs that package non-editably.
 
 `uv` and `npm` create `.venv` and `node_modules` inside the skill directories. Both are
 ignored by git.
@@ -228,24 +253,40 @@ ignored by git.
 On 2026-09-21, run from this public checkout with provider credentials removed, these
 suites reported 98 Jev runtime checks, 50 Jev wrapper tests, 33 browser-use Node tests,
 35 browser-use Python tests, and 9 installer tests, with no failures. The Jev suites
-have grown since, with exact-value binding and declared DOM checks; the counts measured
-on 2026-09-22 are 273 Jev runtime unit checks, 49 Jev runtime `checks`-group checks
-against real headless Chrome, 75 Jev wrapper tests, 52 Jev vendor tests, and 10
-installer tests. After the protocol-consistency follow-up on that layer, the remeasured
-counts are 288 Jev runtime unit checks, 51 `checks`-group checks, and 94 Jev wrapper
-tests; vendor and installer trees were not edited. None of them makes a model call.
-All except the `checks` group use fake runners or offline runtime paths; the `checks`
-group drives real headless Chrome against a loopback fixture. None of them establishes
+have grown since: exact-value binding, declared DOM checks, the confidence cutoffs and
+truncation honesty, and a protocol-consistency follow-up have each landed in turn. The
+first declared-DOM-checks landing measured 273 Jev runtime unit checks, 49 Jev runtime
+`checks`-group checks against real headless Chrome, 75 Jev wrapper tests, 52 Jev vendor
+tests, and 10 installer tests; its own protocol-consistency follow-up remeasured 288
+runtime unit checks, 51 `checks`-group checks, and 94 wrapper tests, with vendor and
+installer untouched. The confidence, truncation and handoff work measured 514 runtime
+unit checks and 85 wrapper tests on its own base, and 522 runtime unit checks, 49
+`checks`-group checks, 23 `guards`-group checks, 96 wrapper tests, 90 vendor tests, and
+10 installer tests once stacked on the declared-DOM-checks layer, before that layer's
+own protocol-consistency follow-up. Those figures are historical. With every layer
+combined in the tree, including the protocol-consistency follow-up and the four
+confidence-safety review fixes, an earlier pass measured 605 runtime unit checks, 51
+`checks`-group checks and 23 `guards`-group checks against real headless Chrome, 104
+wrapper tests, 95 vendor tests, and 10 installer tests; those six figures are historical
+too. On 2026-09-22, with the binding-identity cache fix, the wrapper failure-path
+evidence fix, and the dispatch-correlation fix combined in the tree, the current Jev
+counts are 640 runtime unit checks, 51 `checks`-group checks and 23 `guards`-group
+checks against real headless Chrome, 112 wrapper tests, 106 vendor tests, and 10
+installer tests. The browser-use counts are still the 2026-09-21 measurements. None of
+these suites makes a model call. All except the
+`checks` and `guards` groups use fake runners or offline runtime paths; those two groups
+drive real headless Chrome against a loopback fixture. None of them establishes
 live task success.
 
 Live validation of the native `jev` package is still in progress. A live navigation task
 passed. A live form task has failed in two different ways, and both failures are kept on
 record. Exact-value binding has deterministic tests with mocked model responses only and
-no live run at all. Declared DOM checks do have real headless-browser evidence, because
-they need a page and not a model, but no live model run has used them yet. Do not read
-these deterministic results, or the benchmark below, as proof that form tasks are
-validated. `skills/jev/VALIDATION.md` holds the live record
-and is not allowed to mark a planned check as passed.
+no live run at all. Declared DOM checks and the snapshot truncation flags do have real
+headless-browser evidence, because they need a page and not a model, but no live model
+run has used `checks` or `confidence` yet. Do not read these deterministic results, or
+the benchmark below, as proof that form tasks are validated.
+`skills/jev/VALIDATION.md` holds the live record and is not allowed to mark a planned
+check as passed.
 
 ## Benchmark summary
 

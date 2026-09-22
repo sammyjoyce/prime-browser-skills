@@ -6,8 +6,10 @@ on Python 3.11 and 3.13; the separate browser runtime uses Python 3.12.13.
 Exact-value binding landed later, on 2026-09-22. Every count in the next table is from
 the 2026-09-21 run against the pre-fork tree. The suites have grown since. See
 "Exact-value binding (not live-validated)" for what that change has and has not proven,
-and "Declared DOM checks" for the later `checks` argument, which does have real
-headless-browser evidence.
+"Declared DOM checks" for the later `checks` argument, and "Confidence cutoffs,
+truncation honesty and handoff" for the `confidence` argument and the `needs_review`
+status. The last two have real headless-browser evidence; none of the three has been
+exercised by a live model run.
 
 ## Package and lifecycle checks
 
@@ -245,6 +247,161 @@ Not established by any of this:
   persistence, and the two earlier live form failures below are not affected by it.
 - The group ran on macOS only, against a loopback fixture, in headless Chrome.
 
+## Confidence cutoffs, truncation honesty and handoff (deterministic, including real headless Chrome)
+
+Date: 2026-09-22. Scope: the `confidence` argument on `jev.run`, the shared contract file
+`src/jev/confidence.py`, the three gates and the budget callback inside the vendored
+agent, `text_truncated` in `snapshot.js`, the `needs_review` status, and the new
+`observation`, `side_effects`, `handoff` and `confidence_policy` result keys. Profiles,
+the lifecycle, native PNG capture, login and the exact-value binding rules were not
+changed.
+
+No live model run exercised any of this. Every case below is deterministic: mocked model
+answers, or a real headless Chrome with no model call at all.
+
+These counts are for this work as it stood on the declared-DOM-check layer before
+that layer's row-fingerprint follow-up and before the four review fixes, so every
+figure in the table below is historical; "Re-run deterministic checks" states the
+current combined totals for this tree. On its own base the same work measured 85
+wrapper tests and 514 unit checks.
+
+| Check | Result |
+|---|---|
+| Wrapper suite, `skills/jev/tests/` (92 methods in `test_jev.py` plus 4 real-runtime cases) | 96 tests passed |
+| Runtime unit group, including the new `run_operation` integration tests | 522 checks passed |
+| Runtime `checks` group, real headless Chrome and one real runner process | 49 checks passed |
+| Runtime `guards` group, real headless Chrome, snapshot metadata | 23 checks passed |
+| Vendor fork tests, `tests/test_agent.py` | 90 tests passed |
+| Installer tests, repository `tests/`, run alone | 10 tests passed |
+
+Commands, exit code 0 for each, run on 2026-09-22 from this checkout, in this order:
+
+```sh
+cd skills/jev
+uv sync --project runtime --frozen --reinstall-package jev-ultrafast
+uv run python -m unittest discover -s tests -v
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group unit
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group guards
+cd runtime/vendor/jev-ultrafast && uv run --frozen pytest -q
+uv run --frozen ruff check jev_ultrafast tests scripts
+cd ../../../../.. && python3 -m unittest discover -s tests -v
+```
+
+`--reinstall-package jev-ultrafast` matters here: this work changes vendored files, and
+the runtime installs that package non-editably. The vendor ruff run reports
+`All checks passed!` and exits 0. The installer tests ran alone, because that suite
+fingerprints the whole `skills/` tree and another suite writing a `.pyc` at the same time
+makes it fail.
+
+Lint over every file this change touched outside the vendored tree, with the vendor's own
+ruff and its 120-character line length:
+
+```sh
+cd skills/jev/runtime/vendor/jev-ultrafast
+uv run --frozen ruff check --isolated --line-length 120 --select E,F,I \
+  ../../../src/jev/checks.py ../../../src/jev/confidence.py ../../../src/jev/__init__.py \
+  ../../../runtime/runner.py ../../../runtime/tests/run_tests.py \
+  ../../../runtime/tests/fixture_server.py ../../../tests/test_jev.py \
+  ../../../tests/fake_runner.py ../../../tests/test_runtime_launch.py \
+  ../../../../../tests/test_install.py ../../../../../install.py
+```
+
+It reports 25 findings and exits 1: 16 E501, 6 E402, 2 I001, 1 F401. That is the same
+count, in the same files under the same rules, as the previous change measured on the
+same file list, and `src/jev/confidence.py` reports nothing. The old findings were not
+cleaned up here.
+
+### What the real browser proved: `--group guards`
+
+The new group starts its own headless Chrome on a throwaway profile with its own
+browser-harness daemon and a loopback fixture page, exactly like the `checks` group. It
+makes no model call, needs no API key, opens no window, and never attaches to the user's
+Chrome. `snapshot.js` decides truncation, so a Python-side guess is not evidence:
+
+- A normal page reports `text_truncated: false`, `omitted_actions: 0`, and viewport
+  `w`/`h` of 1120x780, which is the size the vendored `Browser` emulates.
+- 20 visible characters: not truncated, text length 20.
+- Exactly 6000 visible characters: not truncated, text length 6000.
+- 7000 visible characters: truncated, text length 6000.
+- 6000 characters plus one more in-view text node: truncated.
+- 6000 characters plus `display:none` and `hidden` trailing nodes: not truncated.
+- 6000 characters plus a node positioned below the fold: not truncated.
+- 251 in-viewport controls: `omitted_actions` is 1, the element list is capped at 250,
+  and the wait and scroll sentinels are added outside that cap.
+- `runner.observation_of()` over those real snapshots returns exactly the four
+  allowlisted keys with the measured values.
+- After the group, the owned Chrome process is gone and the harness daemon count is back
+  to its pre-test value.
+
+The vendored `scripts/check_guards.py` carries the same snapshot cases, but it needs a
+browser daemon it does not own and was not executed. The owned group above is the
+evidence.
+
+### What the runner integration proved: unit group
+
+Three of the new unit tests drive the real `run_operation` with the real vendored agent
+loop, a fake browser and fake model answers. No Chrome, no daemon, no provider request,
+no key. They are integration tests of the parts that only meet inside `run_operation`:
+
+- Each gate withholds on its own. A low operation score stops before the bind call, the
+  text helper and any input; a low target score does the same; a low binding score binds
+  once and types nothing. A low-confidence "no value fits" answer is withheld, not
+  recorded as a skip.
+- The same low scores with no policy still type the supplied value byte for byte and
+  complete, and the scores are still recorded on the action row.
+- An unbound field with `generation="disabled"` still skips, and a skip leaves the run
+  `none_observed`.
+- An uncosted successful provider attempt stops the run before the bind, before the
+  helper and before input; so does an uncosted bind and an uncosted helper answer. Cost
+  stays `null`, never `0.0`. Over the cap, the next decision cannot act.
+- An interrupted `Browser.act` is `needs_review` with `dispatch="unknown"`, the history
+  row survives, and nothing is retried.
+- A freshness failure before input re-observes and chooses again: no input was
+  dispatched, no row was recorded, and the run stays `none_observed`.
+- DONE on a truncated observation with no declared check is `needs_review` with reason
+  `truncated_done` and `completion_claimed: false`.
+- The same DONE with declared checks is `completed` only when every declared check
+  passed, with a warning that says this is scoped page evidence and not proof the task
+  finished. When the checks failed, and when they could not be read, the status is
+  `needs_review` with reason `truncated_done_checks_not_passed`, the completion claim is
+  cleared, and the check evidence is still reported.
+- BLOCKED with omitted actions is `needs_review`; a truncated page still accepts a click
+  and still completes.
+- An untruncated DONE with no declared check is still a plain `completed`.
+- The task string, a supplied value, a field label that contains a value, and the page
+  text are all absent from every handoff, and the handoff has exactly the allowlisted
+  keys.
+
+### Contract and wrapper evidence
+
+- The wrapper rejects 18 invalid confidence policies before any process starts, and
+  accepts `{}`, a boundary cutoff of 1.0 and the three-gate form.
+- `test_runtime_launch.py` runs the real runtime interpreter and confirms it loaded the
+  wrapper's own `src/jev/confidence.py`, normalized 13 policies identically, rejected the
+  invalid ones with byte-identical messages, and left `confidence` null for `login`.
+- A `needs_review` result raises `jev.JevError` with the partial result, the handoff, the
+  action rows and `completion_claimed: false`.
+- A completed result carrying a handoff is a protocol error, and
+  `side_effects: "confirmed"` is rejected outright, as is any value outside
+  `none_observed` / `uncertain`.
+- A runner result without the new keys still parses, so an older runner is not a
+  protocol error.
+- `classify()` maps the vendored `NeedsReview` to `needs_review`, not to
+  `browser_error`, and a `StalePage` is still `browser_error`.
+
+### Not established by any of this
+
+- No live model run has used `confidence`, and no live run has hit a truncated page and
+  reported `needs_review`. The gates, the budget callback and the truncation rule have
+  deterministic evidence only.
+- The cutoffs are caller policy. Nothing here calibrates a score against a success rate,
+  and no default cutoff exists anywhere in the code.
+- `side_effects: "none_observed"` is measured from dispatched input, not from a server. A
+  page can call an endpoint while loading.
+- The `guards` group ran on macOS only, against a loopback fixture, in headless Chrome.
+- The browser and login groups were not re-run for this change.
+
 ## Re-run deterministic checks
 
 From the installed Jev skill directory:
@@ -255,28 +412,30 @@ uv run python -m unittest discover -s tests -v
 uv run --project runtime --frozen python runtime/tests/run_tests.py --group unit
 ```
 
-These commands require no model key and make no paid model calls. The three
+These commands require no model key and make no paid model calls. The four
 real-runtime wrapper tests skip if runtime setup has not been completed.
 
 `uv sync --project runtime --frozen` installs the vendored `jev-ultrafast` package
-non-editably from `runtime/vendor/jev-ultrafast`. Nothing in the declared-check work
-touches that package, so no reinstall is needed for it. If you do change a vendored
-file, force the copy in the runtime environment to be rebuilt:
+non-editably from `runtime/vendor/jev-ultrafast`. The confidence, truncation and
+dispatch work does change that package, so its copy in the runtime environment must be
+rebuilt before the runtime tests mean anything:
 
 ```sh
 uv sync --project runtime --frozen --reinstall-package jev-ultrafast
 ```
 
-The wrapper package is installed editably from `src/`, so `src/jev/checks.py` is picked
-up without a reinstall. The runner loads that same file by path, so an installed copy
-must always contain both `src/` and `runtime/`; `install.py` copies them together and a
-test in the repository's `tests/test_install.py` checks that.
+The wrapper package is installed editably from `src/`, so `src/jev/checks.py` and
+`src/jev/confidence.py` are picked up without a reinstall. The runner loads both files by
+path, so an installed copy must always contain both `src/` and `runtime/`; `install.py`
+copies them together and a test in the repository's `tests/test_install.py` checks that.
 
-The declared-check group starts its own headless Chrome and its own browser-harness
-daemon on a temporary profile. It opens no window and makes no model call:
+The declared-check group and the snapshot guard group each start their own headless
+Chrome and their own browser-harness daemon on a temporary profile. They open no window
+and make no model call:
 
 ```sh
 uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group guards
 ```
 
 The following additional groups open real Chrome windows and use a loopback fixture.
@@ -287,9 +446,22 @@ uv run --project runtime --frozen python runtime/tests/run_tests.py --group brow
 uv run --project runtime --frozen python runtime/tests/run_tests.py --group login
 ```
 
-`--group all` ran all 146 runtime checks on 2026-09-21, before the unit group grew. The
-unit group is now 288 checks and the `checks` group is 51. The browser and login
-groups were not re-run after the follow-up, so no new all-groups total is claimed. Raw
+`--group all` ran all 146 runtime checks on 2026-09-21, before the unit group grew. On
+2026-09-22 the unit group was 273 checks and the `checks` group 49; the declared-check
+follow-up that validates every result path took the unit group to 281, and the
+confidence, truncation and handoff work measured 514 on its own base. The
+row-fingerprint correspondence follow-up, on the declared-check layer alone, took the
+unit group to 288 checks and the `checks` group to 51. With confidence, truncation and
+handoff stacked on the declared-check layer, before that follow-up, the unit group was
+522 checks, the `checks` group unchanged at 49, and the new `guards` group 23. Those
+five figures are historical. With every layer combined in this tree, including the
+row-fingerprint correspondence fix and the four confidence-safety review fixes below,
+the unit group is 605 checks, the `checks` group is 51, and the `guards` group is 23;
+those three figures are historical too. With the three landing repairs in "Combined
+landing-repair validation" below (binding-identity cache, wrapper failure-path evidence,
+dispatch correlation), measured on 2026-09-22, the unit group is 640 checks, the
+`checks` group is still 51, and the `guards` group is still 23. The browser and login
+groups have not been re-run since 2026-09-21, so no new all-groups total is claimed. Raw
 local screenshots, browser profiles, provider logs and Prime Agent transcripts are not
 included in the public repository.
 
@@ -306,3 +478,120 @@ included in the public repository.
 - Model costs are soft limits, checked between calls. Unknown usage stops execution.
 - Browser screenshots and page text may contain private data and are not sanitized.
 - Linux support follows the code paths, but these live checks ran on macOS only.
+
+## B review-fix validation (isolated archive of `b121a46`)
+
+Date: 2026-09-22. Scope: the four final-review findings on
+`771e3bc..b121a46` only. This record is from an isolated archive of `b121a46`
+plus the review-fix patch; it does not replace the stacked counts in the table
+above, because follow-up A is still adding tests in the live tree.
+
+The source-level gate claims that this patch changes:
+
+- `run_operation` re-reads `safe_snapshot(agent)` after the loop or an
+  exception, so `result["observation"]` and `handoff["observation"]` describe
+  the page the executor stopped on. The generator yield is used only if that
+  in-memory snapshot cannot be read. No extra CDP observation is added.
+- The target gate applies from `action["kind"] not in {"wait", "scroll"}`. A
+  click, fill or select with `target is None` is withheld when the target
+  cutoff is on. `choose()` is unchanged: targeted operations still always
+  carry a target.
+- Truncated DONE is accepted only through the `checks` seam. There is no
+  `allow_truncated_done` constructor flag.
+- `handoff` is null on a completed run, on a failure before the agent observed
+  a page, and on a DONE that later failed only at screenshot capture or
+  cleanup. It is not invented after DONE. An unresolved decision still carries
+  the allowlisted record and the no-replay resume policy.
+
+Commands, all exit 0, run in the isolated archive after
+`uv sync --project runtime --frozen --reinstall-package jev-ultrafast`:
+
+```sh
+cd skills/jev
+uv run python -m unittest discover -s tests -v
+# Ran 96 tests in 20.304s, OK
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group unit
+# 598 checks, 0 failed
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+# 49 checks, 0 failed
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group guards
+# 23 checks, 0 failed
+cd runtime/vendor/jev-ultrafast && uv run --frozen pytest -q
+# 95 passed
+uv run --frozen ruff check jev_ultrafast tests scripts
+# All checks passed!
+cd ../../../../.. && python3 -m unittest discover -s tests -v
+# Ran 10 tests, OK (installer, run alone)
+```
+
+Relative to the `b121a46` table above (96 / 522 / 49 / 23 / 90 / 10), this
+isolated patch measured 96 wrapper, 598 unit, 49 checks, 23 guards, 95 vendor,
+10 installer. The unit group grew by the live-observation and null-target
+`run_operation` checks; the vendor group grew by the kind-based target-gate
+and `choose()` invariant cases. Combined live-tree totals are left to parent
+integration with A's tests.
+
+## Combined landing-repair validation
+
+Date: 2026-09-22. Scope: the three approved landing repairs, combined in this tree on
+`feat/jev-decision-safety`.
+
+1. Binding-identity cache fix, in vendor `agent.py`.
+2. Wrapper failure-path verification-evidence fix, in `src/jev/__init__.py`.
+3. Dispatch-correlation fix, in the runtime `agent.py` and `runner.py`.
+
+All three repairs are now committed (`72e4590`, `a4ceb59`, `fe2a70d`); the third was
+still uncommitted in the working tree when these commands ran. Each repair was probed
+on its own before this
+run; those reports are `/tmp/jev-landing-fix-2.md`, `-3.md` and `-4.md`. Every command
+and count below is a fresh run against the combined tree. None of it copies those
+isolated numbers.
+
+Commands, all exit 0, run from `feat/jev-decision-safety`:
+
+```sh
+cd skills/jev
+uv sync --project runtime --frozen --reinstall-package jev-ultrafast
+uv run --frozen python -m unittest discover -s tests -v
+# Ran 112 tests in 40.976s, OK (0 skipped)
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group unit
+# 640 checks, 0 failed
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+# 51 checks, 0 failed
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group guards
+# 23 checks, 0 failed
+cd runtime/vendor/jev-ultrafast && uv run --frozen pytest -q
+# 106 passed
+uv run --frozen ruff check .
+# All checks passed!
+cd ../../../../.. && python3 -m unittest discover -s tests -v
+# Ran 10 tests in 1.149s, OK (installer, run alone after every suite above finished)
+```
+
+The pre-repair origin tip `0175169` measured 104 wrapper, 605 unit, 51 `checks`, 23
+`guards`, 95 vendor and 10 installer tests (see "Re-run deterministic checks" above).
+The combined tree adds 8 wrapper tests, 35 unit checks and 11 vendor tests. `checks`,
+`guards` and installer stay the same, because none of the three repairs touch
+`checks.py`, snapshot truncation or `install.py`.
+
+Each new-test claim was checked by name, not just by count:
+
+| Repair | New tests | Where confirmed | Result |
+|---|---|---|---|
+| Cache fix | 5 vendor tests | Re-selected with `pytest -k`, e.g. `test_stale_retry_does_not_reuse_a_binding_on_another_field` | All 5 pass |
+| Wrapper fix | 8 wrapper tests | `git diff 0175169..HEAD` on `tests/test_jev.py`: 8 new `def test_`, 0 removed | Ran inside the 112-test pass |
+| Dispatch-correlation fix | 6 vendor tests | `git show fe2a70d -- skills/jev/runtime/vendor/jev-ultrafast/tests/test_agent.py`: 6 new `def test_`, 0 removed; re-selected with `pytest -k` | All 6 pass |
+| Dispatch-correlation fix | 35 unit checks | `git show fe2a70d -- skills/jev/runtime/tests/run_tests.py`: 37 new `check()` calls, 2 rename existing checks onto the new contract, so 35 are net new | All 32 `dispatch_correlation.*` and 5 `safety.dispatch_*` checks pass |
+
+The installed runtime copy of `jev-ultrafast` matches the source. After the reinstall,
+`runtime/.venv/lib/python3.12/site-packages/jev_ultrafast/agent.py` is byte-identical to
+`runtime/vendor/jev-ultrafast/jev_ultrafast/agent.py`. It carries both `binding_identity`
+and `decision_seq`/`latest_dispatch`.
+
+No source file changed to reach these results. Only `README.md` and this file changed.
+No live model call ran, and no headed browser ran. `--group browser` and `--group
+login` did not run, so this entry says nothing about those two groups or about live
+provider behaviour. The `checks` and `guards` groups start and stop their own headless
+Chrome. Their own `snapshot.owned_chrome_is_gone` and `snapshot.no_daemon_was_left_behind`
+checks confirmed a clean exit. A process check after the run found no leftover Chrome
+or daemon process. No nested delegation ran this validation.
