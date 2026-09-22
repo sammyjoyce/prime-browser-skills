@@ -540,8 +540,9 @@ Date: 2026-09-22. Scope: the three approved landing repairs, combined in this tr
 2. Wrapper failure-path verification-evidence fix, in `src/jev/__init__.py`.
 3. Dispatch-correlation fix, in the runtime `agent.py` and `runner.py`.
 
-The first two are already committed (`72e4590`, `a4ceb59`). The third sat uncommitted
-in the working tree at validation time. Each repair was probed on its own before this
+All three repairs are now committed (`72e4590`, `a4ceb59`, `fe2a70d`); the third was
+still uncommitted in the working tree when these commands ran. Each repair was probed
+on its own before this
 run; those reports are `/tmp/jev-landing-fix-2.md`, `-3.md` and `-4.md`. Every command
 and count below is a fresh run against the combined tree. None of it copies those
 isolated numbers.
@@ -579,8 +580,8 @@ Each new-test claim was checked by name, not just by count:
 |---|---|---|---|
 | Cache fix | 5 vendor tests | Re-selected with `pytest -k`, e.g. `test_stale_retry_does_not_reuse_a_binding_on_another_field` | All 5 pass |
 | Wrapper fix | 8 wrapper tests | `git diff 0175169..HEAD` on `tests/test_jev.py`: 8 new `def test_`, 0 removed | Ran inside the 112-test pass |
-| Dispatch-correlation fix | 6 vendor tests | `git diff` on the working-tree `tests/test_agent.py`: 6 new `def test_`, 0 removed; re-selected with `pytest -k` | All 6 pass |
-| Dispatch-correlation fix | 35 unit checks | `git diff` on the working-tree `run_tests.py`: 37 new `check()` calls, 2 rename existing checks onto the new contract, so 35 are net new | All 32 `dispatch_correlation.*` and 5 `safety.dispatch_*` checks pass |
+| Dispatch-correlation fix | 6 vendor tests | `git show fe2a70d -- skills/jev/runtime/vendor/jev-ultrafast/tests/test_agent.py`: 6 new `def test_`, 0 removed; re-selected with `pytest -k` | All 6 pass |
+| Dispatch-correlation fix | 35 unit checks | `git show fe2a70d -- skills/jev/runtime/tests/run_tests.py`: 37 new `check()` calls, 2 rename existing checks onto the new contract, so 35 are net new | All 32 `dispatch_correlation.*` and 5 `safety.dispatch_*` checks pass |
 
 The installed runtime copy of `jev-ultrafast` matches the source. After the reinstall,
 `runtime/.venv/lib/python3.12/site-packages/jev_ultrafast/agent.py` is byte-identical to
