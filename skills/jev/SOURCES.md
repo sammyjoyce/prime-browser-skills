@@ -6,19 +6,26 @@
 - Pinned commit: `1231850a0bf1a0c0341fe408ef1668dbbfdfac46`.
 - License: MIT. The bundled upstream license is retained with its source.
 - The vendored tree is a maintained fork of that commit. Local changes sit in
-  `jev_ultrafast/agent.py`, `model.py`, `questions.py`, `browser.py`,
+  `jev_ultrafast/agent.py`, `model.py`, `snapshot.js`, `questions.py`, `browser.py`,
   `scripts/check_guards.py` and `tests/test_agent.py`. They add exact-value binding, let
   a null text-helper answer skip a field instead of ending the run, clear a field with a
-  Delete key event, and add a fixture check that an empty value clears the field and
-  fires an input event.
-- The prompt surface changed only for value binding. When the caller supplies values,
-  the decision request gains a `supplied_values` state entry holding an 80-character
-  preview per key, the TYPE_TEXT label says a supplied value may provide the text, and
-  a new `BIND_VALUE` question asks which supplied value belongs in the field.
-- Unchanged from upstream: the DOM snapshot rules, the NEXT_ACTION and TARGET rules,
-  the request body when no values are supplied, the retry policy and the TypeSafe choice
-  validation in `validate_choice`. `field_text()` now accepts `{"text": null}` as a
-  no-value answer, so text-helper response validation did change.
+  Delete key event, report whether the snapshot's visible text was truncated, withhold
+  input for a low confidence score, an unpaid budget or an uncertain dispatch, and add
+  the matching fixture and snapshot checks.
+- The prompt surface changed for value binding and for observation honesty. When the
+  caller supplies values, the decision request gains a `supplied_values` state entry
+  holding an 80-character preview per key, the TYPE_TEXT label says a supplied value may
+  provide the text, and a new `BIND_VALUE` question asks which supplied value belongs in
+  the field. Separately, and on every request including the ones with no values, the
+  decision and binding calls now carry an `observation` object beside `page` with
+  `omitted_actions`, `text_truncated` and the viewport, so the model is told when its
+  evidence was cut. The NEXT_ACTION and TARGET rule strings are unchanged.
+- Unchanged from upstream: how the DOM snapshot is collected, including the
+  6000-character and 250-action caps, the NEXT_ACTION and TARGET rules, the retry policy
+  and the TypeSafe choice validation in `validate_choice`. What the snapshot returns did
+  change: one more flag, `text_truncated`. The request body when no values are supplied
+  did change too, by that one `observation` object. `field_text()` now accepts
+  `{"text": null}` as a no-value answer, so text-helper response validation changed.
   `runtime/vendor/PROVENANCE.md` holds the file-by-file record.
 - Native runtime changes outside the vendored tree are provider routing, dedicated
   browser ownership, named-profile lifecycle, execution limits, accounting, direct PNG
@@ -64,9 +71,15 @@ Changed here, deliberately:
 - `id` defaults to `check[<index>]`, and the normalized snapshot is itself valid input,
   so the wrapper can send exactly what it validated.
 - Not adopted: the `Engine` loop, the provider adapters, `allow`/`origins`, milestones,
-  extractions, collectors, the confidence thresholds, and the new status strings
-  (`needs_review`, `policy_blocked`, `verification_failed`). Declared checks never
-  change a run's status.
+  extractions, collectors, `policy_blocked` and `verification_failed`. Declared checks
+  never change a run's status.
+- Confidence cutoffs and `needs_review` were written here afterwards, in
+  `src/jev/confidence.py`, `jev_ultrafast/agent.py` and `runtime/runner.py`, not taken
+  from that branch. The differences are deliberate: every gate is opt-in with no default
+  cutoff, because this project has no evaluation set that would justify a calibrated
+  number; truncation does not halt an ordinary click; and a declared check that passes
+  is still scoped DOM evidence, so it can release only a provisional truncated DONE and
+  never sets `output["verification"]` or claims persistence.
 
 ## Local evidence
 

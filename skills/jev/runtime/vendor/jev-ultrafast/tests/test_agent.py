@@ -9,6 +9,7 @@ import pytest
 
 from jev_ultrafast import agent as loop
 from jev_ultrafast import model
+from jev_ultrafast.agent import NeedsReview
 from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
 
 
@@ -52,12 +53,26 @@ def choice(ids, selected):
     return {"choice": selected, "confidence": 1.0, "probabilities": {i: float(i == selected) for i in ids}}
 
 
-def decision(action="e1"):
+def decision(action="e1", *, confidence=1.0, target_confidence=None, operation=None, target=None):
+    spec = {
+        "e1": ("TYPE_TEXT", "1"),
+        "e2": ("CLICK", "1"),
+        "e3": ("CLICK", "2"),
+        "wait": ("WAIT", None),
+        "DONE": ("DONE", None),
+        "BLOCKED": ("BLOCKED", None),
+    }
+    inferred_operation, inferred_target = spec.get(action, ("CLICK", "1"))
+    operation = inferred_operation if operation is None else operation
+    target = inferred_target if target is None else target
+    if target_confidence is None:
+        target_confidence = None if target is None else 1.0
     return {
         "choice": action,
-        "operation": "TYPE_TEXT",
-        "target": "1",
-        "confidence": 1.0,
+        "operation": operation,
+        "target": target,
+        "confidence": confidence,
+        "target_confidence": target_confidence,
         "probabilities": {action: 1.0},
         "latency_ms": 10,
         "usage": {},
@@ -113,6 +128,27 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     assert len(calls) == 1
     assert d["operation"] == "TYPE_TEXT" and d["target"] == "1" and d["choice"] == "e1"
     assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target"}
+
+
+def test_choose_sets_a_target_for_click_and_none_for_wait(monkeypatch):
+    """choose() still always binds a target when the operation has one."""
+
+    def post_for(operation, target=None):
+        def post(_url, _key, body):
+            questions = body["questions"]
+            answers = {"operation": choice(questions["operation"]["criteria"], operation)}
+            if operation == "CLICK":
+                answers["click_target"] = choice(questions["click_target"]["criteria"], target)
+            return {"model": "test", "answers": answers}
+        return post
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post_for("CLICK", "2"))
+    clicked = model.choose(page(), "Find a book", [])
+    assert clicked["operation"] == "CLICK" and clicked["target"] == "2" and clicked["choice"] == "e3"
+    monkeypatch.setattr(model, "post_json", post_for("WAIT"))
+    waited = model.choose(page(), "Find a book", [])
+    assert waited["operation"] == "WAIT" and waited["target"] is None and waited["choice"] == "wait"
 
 
 def test_click_cannot_consume_a_text_target(monkeypatch):
@@ -183,6 +219,9 @@ def runner():
     a.pending_text = None
     a.values = {}
     a.generation = "helper"
+    a.confidence = None
+    a.budget_guard = None
+    a.checks = None
     p = page()
     a.state = {
         "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
@@ -196,6 +235,7 @@ def runner():
         "record": False,
         "text_calls": [],
         "bind_calls": [],
+        "provisional_done": False,
     }
     return a
 
@@ -260,9 +300,14 @@ def test_loading_waits_do_not_trigger_no_progress_stop(runner):
 def test_stale_observation_preserves_executed_action(runner):
     runner.state["decision"] = decision("e3")
     runner.state["browser"].observe.side_effect = StalePage("changed")
-    with pytest.raises(StalePage):
+    with pytest.raises(NeedsReview) as caught:
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
-    assert runner.state["history"][-1]["action"] == "Go"
+    assert caught.value.reason == "stale_after_input"
+    assert caught.value.input_dispatched == "attempted"
+    entry = runner.state["history"][-1]
+    assert entry["action"] == "Go"
+    assert entry["dispatch"] == "attempted"
+    assert runner.state["status"] == "needs_review"
     runner.state["browser"].act.assert_called_once()
 
 
@@ -392,12 +437,14 @@ def test_choose_offers_supplied_values_and_leaves_the_unbound_request_alone(monk
     model.choose(page(), "Book a room", [])
     model.choose(page(), "Book a room", [], values={"city": "Z" * 200, "note": "hi"})
     plain, bound = bodies
+    expected_observation = {"omitted_actions": 0, "text_truncated": False, "viewport": {"w": None, "h": None}}
     assert "supplied_values" not in plain["state"]
     assert bound["state"]["supplied_values"] == {"city": "Z" * 80, "note": "hi"}
     assert "A small LLM will supply" in plain["questions"]["operation"]["criteria"]["TYPE_TEXT"]
     assert "A supplied value" in bound["questions"]["operation"]["criteria"]["TYPE_TEXT"]
     assert plain["state"]["page"] == bound["state"]["page"]
     assert plain["state"]["elements"] == bound["state"]["elements"]
+    assert plain["state"]["observation"] == bound["state"]["observation"] == expected_observation
 
 
 def test_bind_value_offers_every_supplied_key_plus_none(monkeypatch):
@@ -427,6 +474,13 @@ def test_bind_value_offers_every_supplied_key_plus_none(monkeypatch):
     assert body["model"] == "jev-test"
     assert len(body["state"]["page"]["text"]) == 6000
     assert body["state"]["page"]["url"] == "https://example.test/"
+    assert body["state"]["observation"] == {
+        "omitted_actions": 0,
+        "text_truncated": False,
+        "viewport": {"w": None, "h": None},
+    }
+    assert "supplied_values" not in body["state"]
+    assert long_value not in json.dumps(body)
     assert body["state"]["recent_actions"] == [{"action": "Search", "text": "book"}]
     assert answer["key"] == "city"
     assert answer["model"] == "test" and answer["latency_ms"] >= 0
@@ -711,3 +765,545 @@ def test_non_empty_text_is_still_inserted_verbatim(monkeypatch):
     inserted = [params["text"] for method, params in calls if method == "Input.insertText"]
     assert inserted == [" Z\u00fcrich. "]
     assert [k["key"] for method, k in calls if method == "Input.dispatchKeyEvent"] == ["a", "a"]
+
+
+# --- Observation metadata on decision and bind requests -----------------------
+
+
+def test_choose_observation_defaults_when_snapshot_keys_are_missing(monkeypatch):
+    captured = []
+
+    def post(_url, _key, body):
+        captured.append(body)
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "TYPE_TEXT"),
+                "type_text_target": choice(["1"], "1"),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose(page(), "Find a book", [])
+    observation = captured[0]["state"]["observation"]
+    assert set(observation) == {"omitted_actions", "text_truncated", "viewport"}
+    assert observation == {"omitted_actions": 0, "text_truncated": False, "viewport": {"w": None, "h": None}}
+
+
+def test_choose_observation_uses_snapshot_flags(monkeypatch):
+    captured = []
+
+    def post(_url, _key, body):
+        captured.append(body)
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
+                "click_target": choice(["1", "2"], "2"),
+                "type_text_target": choice(["1"], "1"),
+            },
+        }
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", post)
+    p = page()
+    p["omitted_actions"] = 12
+    p["text_truncated"] = True
+    p["w"], p["h"] = 1120, 780
+    model.choose(p, "Find a book", [])
+    assert captured[0]["state"]["observation"] == {
+        "omitted_actions": 12,
+        "text_truncated": True,
+        "viewport": {"w": 1120, "h": 780},
+    }
+    assert "observation" not in captured[0]["state"]["page"]
+
+
+class Stopped(Exception):
+    """Stand-in for the runner's stop exception. Vendor must not import runner."""
+
+
+def _assert_no_input(runner, helper=None, binder=None):
+    runner.state["browser"].act.assert_not_called()
+    if helper is not None:
+        helper.assert_not_called()
+    if binder is not None:
+        binder.assert_not_called()
+    assert runner.pending_text is None
+
+
+def test_low_operation_confidence_withholds_before_bind_helper_and_input(runner, monkeypatch):
+    binder = Mock(return_value=binding("city"))
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"city": "Zurich"}
+    runner.confidence = {"operation": 0.8, "target": 0.5}
+    runner.state["decision"] = decision(confidence=0.2, target_confidence=0.99)
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "low_operation_confidence"
+    assert caught.value.input_dispatched == "not_dispatched"
+    assert caught.value.handoff["resume_policy"] == loop.RESUME_POLICY
+    _assert_no_input(runner, helper=helper, binder=binder)
+    assert len(runner.state["history"]) == 1
+    entry = runner.state["history"][0]
+    assert entry["dispatch"] == "not_dispatched"
+    assert entry["page_changed"] is False
+    assert entry["operation_confidence"] == 0.2
+    assert entry["target_confidence"] == 0.99
+    assert entry["binding_confidence"] is None
+    assert entry["text"] is None
+    assert runner.state["status"] == "needs_review"
+    assert runner.state["review_reason"] == "low_operation_confidence"
+
+
+def test_low_target_confidence_withholds_before_bind_and_helper(runner, monkeypatch):
+    binder = Mock(return_value=binding("city"))
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"city": "Zurich"}
+    runner.confidence = {"operation": 0.5, "target": 0.8}
+    runner.state["decision"] = decision(confidence=0.99, target_confidence=0.2)
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "low_target_confidence"
+    _assert_no_input(runner, helper=helper, binder=binder)
+    assert runner.state["history"][0]["dispatch"] == "not_dispatched"
+
+
+def test_low_binding_confidence_calls_bind_once_and_does_not_type(runner, monkeypatch):
+    binder = Mock(return_value={**binding("city"), "confidence": 0.2})
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"city": "Zurich"}
+    runner.confidence = {"operation": 0.5, "target": 0.5, "binding": 0.9}
+    runner.state["decision"] = decision(confidence=0.99, target_confidence=0.99)
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "low_binding_confidence"
+    assert caught.value.binding_key == "city"
+    assert caught.value.binding_confidence == 0.2
+    binder.assert_called_once()
+    helper.assert_not_called()
+    runner.state["browser"].act.assert_not_called()
+    assert runner.pending_text is None
+    entry = runner.state["history"][0]
+    assert entry["dispatch"] == "not_dispatched"
+    assert entry["binding_confidence"] == 0.2
+    assert entry["value_key"] == "city"
+    assert entry["text"] is None
+    assert "Zurich" not in json.dumps(entry)
+    assert "Zurich" not in json.dumps(runner.state["bind_calls"])
+
+
+def test_low_confidence_none_binding_is_withheld_not_skipped(runner, monkeypatch):
+    binder = Mock(return_value={**binding(None), "confidence": 0.1})
+    helper = Mock()
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"city": "Zurich"}
+    runner.generation = "disabled"
+    runner.confidence = {"binding": 0.5}
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "low_binding_confidence"
+    helper.assert_not_called()
+    runner.state["browser"].act.assert_not_called()
+    entry = runner.state["history"][0]
+    assert entry["value_source"] is None
+    assert entry["note"] is None
+    assert entry["dispatch"] == "not_dispatched"
+
+
+def test_operation_gate_only_does_not_block_low_target(runner, monkeypatch):
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.confidence = {"operation": 0.8}
+    runner.state["decision"] = decision(confidence=0.9, target_confidence=0.1)
+    act(runner)
+    helper.assert_called_once()
+    runner.state["browser"].act.assert_called_once()
+    assert runner.state["history"][-1]["dispatch"] == "attempted"
+
+
+def test_binding_gate_only_still_binds_when_operation_is_low(runner, monkeypatch):
+    binder = Mock(return_value=binding("city"))
+    helper = Mock()
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"city": "Zurich"}
+    runner.generation = "disabled"
+    runner.confidence = {"binding": 0.5}
+    runner.state["decision"] = decision(confidence=0.1, target_confidence=0.1)
+    act(runner)
+    binder.assert_called_once()
+    helper.assert_not_called()
+    assert runner.state["browser"].act.call_args.kwargs["text"] == "Zurich"
+    assert runner.state["history"][-1]["dispatch"] == "attempted"
+
+
+def test_no_confidence_policy_records_low_scores_and_still_types(runner, monkeypatch):
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.confidence = None
+    runner.state["decision"] = decision(confidence=0.1, target_confidence=0.1)
+    act(runner)
+    runner.state["browser"].act.assert_called_once()
+    entry = runner.state["history"][-1]
+    assert entry["confidence"] == 0.1
+    assert entry["operation_confidence"] == 0.1
+    assert entry["dispatch"] == "attempted"
+
+
+def test_empty_confidence_dict_does_not_withhold(runner, monkeypatch):
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.confidence = {}
+    runner.state["decision"] = decision(confidence=0.1, target_confidence=0.1)
+    act(runner)
+    runner.state["browser"].act.assert_called_once()
+
+
+def test_generation_disabled_none_binding_still_skips_when_gate_passes(runner, monkeypatch):
+    monkeypatch.setattr(loop, "bind_value", Mock(return_value=binding(None)))
+    helper = Mock()
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"city": "Zurich"}
+    runner.generation = "disabled"
+    runner.confidence = {"binding": 0.5}
+    act(runner)
+    helper.assert_not_called()
+    runner.state["browser"].act.assert_not_called()
+    entry = runner.state["history"][-1]
+    assert (entry["value_key"], entry["value_source"]) == (None, "skipped")
+    assert entry["dispatch"] == "not_dispatched"
+    assert entry["binding_confidence"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["Ends with a period.", "trailing space ", "Z\u00fcrich Hauptbahnhof", "two\nlines", "", "x" * 200],
+)
+def test_high_cutoffs_still_type_supplied_values_byte_for_byte(runner, monkeypatch, value):
+    monkeypatch.setattr(loop, "bind_value", Mock(return_value=binding("city")))
+    helper = Mock()
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"city": value}
+    runner.generation = "disabled"
+    runner.confidence = {"operation": 1.0, "target": 1.0, "binding": 1.0}
+    act(runner)
+    assert runner.state["browser"].act.call_args.kwargs["text"] == value
+    helper.assert_not_called()
+    entry = runner.state["history"][-1]
+    assert (entry["value_key"], entry["value_source"], entry["text"]) == ("city", "supplied", value)
+    assert entry["dispatch"] == "attempted"
+
+
+def test_wait_skips_the_target_gate(runner):
+    runner.confidence = {"target": 0.99}
+    runner.state["decision"] = decision("wait", confidence=1.0, target_confidence=None)
+    act(runner)
+    runner.state["browser"].act.assert_called_once()
+    entry = runner.state["history"][-1]
+    assert entry["kind"] == "wait"
+    assert entry["dispatch"] == "not_dispatched"
+    assert entry["target_confidence"] is None
+
+
+def test_scroll_skips_the_target_gate(runner):
+    runner.state["page"]["actions"].append(
+        {"id": "scroll", "kind": "scroll", "label": "Scroll down", "delta": 400, "node": 99}
+    )
+    runner.confidence = {"target": 0.99}
+    malformed = decision("wait", confidence=1.0, target_confidence=None)
+    malformed["choice"] = "scroll"
+    malformed["operation"] = "SCROLL"
+    runner.state["decision"] = malformed
+    act(runner)
+    runner.state["browser"].act.assert_called_once()
+    entry = runner.state["history"][-1]
+    assert entry["kind"] == "scroll"
+    assert entry["dispatch"] == "attempted"
+
+
+@pytest.mark.parametrize(
+    "action_id,score_missing",
+    [("e3", False), ("e3", True), ("e1", False)],
+)
+def test_null_target_fails_closed_on_action_kind(runner, monkeypatch, action_id, score_missing):
+    binder = Mock()
+    helper = Mock()
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.confidence = {"target": 0.9}
+    malformed = decision(action_id, confidence=1.0, target_confidence=0.01)
+    malformed["target"] = None
+    if score_missing:
+        malformed.pop("target_confidence", None)
+    runner.state["decision"] = malformed
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "low_target_confidence"
+    _assert_no_input(runner, helper=helper, binder=binder)
+    assert runner.state["history"][-1]["dispatch"] == "not_dispatched"
+
+
+def test_missing_target_confidence_fails_closed_when_target_gate_is_on(runner, monkeypatch):
+    binder = Mock()
+    helper = Mock()
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.confidence = {"target": 0.5}
+    runner.state["decision"] = decision(confidence=1.0, target_confidence=float("nan"))
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "low_target_confidence"
+    _assert_no_input(runner, helper=helper, binder=binder)
+
+
+def test_malformed_operation_score_fails_closed_when_gate_configured(runner, monkeypatch):
+    helper = Mock()
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.confidence = {"operation": 0.5}
+    runner.state["decision"] = decision(confidence=None)
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "low_operation_confidence"
+    helper.assert_not_called()
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_bool_cutoff_fails_closed(runner, monkeypatch):
+    helper = Mock()
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.confidence = {"operation": True}
+    runner.state["decision"] = decision(confidence=1.0)
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "low_operation_confidence"
+    helper.assert_not_called()
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_budget_stop_after_predict_prevents_act(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
+    runner.budget_guard = Mock(side_effect=Stopped("cost_unknown"))
+    runner.state["decision"] = None
+    runner.state["status"] = "ready"
+    with pytest.raises(Stopped, match="cost_unknown"):
+        runner.command("tick")
+    runner.state["browser"].act.assert_not_called()
+    assert runner.pending_text is None
+    assert runner.state["history"] == []
+
+
+def test_budget_stop_at_start_of_act_prevents_bind(runner, monkeypatch):
+    binder = Mock(return_value=binding("city"))
+    helper = Mock()
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"city": "Zurich"}
+    runner.budget_guard = Mock(side_effect=Stopped("cost_limit"))
+    with pytest.raises(Stopped, match="cost_limit"):
+        act(runner)
+    binder.assert_not_called()
+    helper.assert_not_called()
+    runner.state["browser"].act.assert_not_called()
+    assert runner.pending_text is None
+
+
+def test_budget_stop_after_bind_prevents_helper_and_input(runner, monkeypatch):
+    binder = Mock(return_value=binding("city"))
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"city": "Zurich"}
+
+    def guard():
+        if runner.state["bind_calls"]:
+            raise Stopped("cost_unknown")
+
+    runner.budget_guard = guard
+    with pytest.raises(Stopped, match="cost_unknown"):
+        act(runner)
+    binder.assert_called_once()
+    helper.assert_not_called()
+    runner.state["browser"].act.assert_not_called()
+    assert runner.pending_text is None
+
+
+def test_budget_stop_after_helper_prevents_input(runner, monkeypatch):
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    monkeypatch.setattr(loop, "field_text", helper)
+
+    def guard():
+        if runner.state["text_calls"]:
+            raise Stopped("cost_unknown")
+
+    runner.budget_guard = guard
+    with pytest.raises(Stopped, match="cost_unknown"):
+        act(runner)
+    helper.assert_called_once()
+    runner.state["browser"].act.assert_not_called()
+    assert runner.pending_text is None
+
+
+def test_budget_stop_clears_pending_text_from_a_stale_retry(runner, monkeypatch):
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.state["browser"].act.side_effect = StalePage("Changed before input")
+    with pytest.raises(StalePage):
+        act(runner)
+    assert runner.pending_text is not None
+    runner.state["decision"] = decision()
+    runner.budget_guard = Mock(side_effect=Stopped("cost_limit"))
+    with pytest.raises(Stopped):
+        act(runner)
+    assert runner.pending_text is None
+    helper.assert_called_once()
+
+
+def test_select_interruption_is_needs_review_with_unknown_dispatch(runner):
+    runner.state["page"]["actions"].append(
+        {
+            "id": "e4",
+            "kind": "select",
+            "label": "Category → Design",
+            "role": "combobox",
+            "value": "Design",
+            "node": 40,
+        }
+    )
+    runner.state["decision"] = decision("e4", operation="SELECT", target="1:1", target_confidence=1.0)
+    runner.state["browser"].act.side_effect = RuntimeError(
+        "Dropdown execution was interrupted; inspect before retrying."
+    )
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "input_interrupted"
+    assert caught.value.input_dispatched == "unknown"
+    entry = runner.state["history"][-1]
+    assert entry["dispatch"] == "unknown"
+    assert entry["action"] == "Category → Design"
+    assert runner.state["status"] == "needs_review"
+    assert runner.state["history"]
+
+
+def test_tick_does_not_retry_an_unknown_dispatch(runner, monkeypatch):
+    monkeypatch.setattr(loop, "choose", Mock(return_value=decision("e3")))
+    runner.state["decision"] = None
+    runner.state["status"] = "ready"
+    runner.state["browser"].act.side_effect = RuntimeError(
+        "Dropdown execution was interrupted; inspect before retrying."
+    )
+    with pytest.raises(NeedsReview) as caught:
+        runner.command("tick")
+    assert caught.value.reason == "input_interrupted"
+    assert runner.state["status"] == "needs_review"
+    assert runner.state["history"][-1]["dispatch"] == "unknown"
+    # tick must not have cleared history or switched back to ready for a replay.
+    assert runner.state["decision"] is None
+
+
+def test_truncated_done_is_withheld_without_checks(runner):
+    runner.state["page"]["text_truncated"] = True
+    runner.state["decision"] = decision("DONE")
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "truncated_done"
+    assert caught.value.input_dispatched == "not_dispatched"
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["status"] == "needs_review"
+    assert runner.state["history"][-1]["dispatch"] == "not_dispatched"
+
+
+def test_omitted_actions_blocked_is_withheld(runner):
+    runner.state["page"]["omitted_actions"] = 12
+    runner.state["decision"] = decision("BLOCKED")
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "truncated_blocked"
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["status"] == "needs_review"
+
+
+def test_click_is_allowed_on_a_truncated_observation(runner):
+    runner.state["page"]["text_truncated"] = True
+    runner.state["page"]["omitted_actions"] = 12
+    runner.state["decision"] = decision("e3")
+    act(runner)
+    runner.state["browser"].act.assert_called_once()
+    assert runner.state["history"][-1]["dispatch"] == "attempted"
+    assert runner.state["status"] == "ready"
+
+
+def test_truncated_done_is_accepted_when_checks_are_declared(runner):
+    runner.state["page"]["text_truncated"] = True
+    runner.checks = [{"kind": "url_contains", "value": "example"}]
+    runner.state["decision"] = decision("DONE")
+    act(runner)
+    runner.state["browser"].act.assert_not_called()
+    assert runner.state["status"] == "done"
+    # The runtime reads this flag and still refuses to call the run completed
+    # unless every declared check passed. PROVISIONAL is said out loud, in state.
+    assert runner.state["provisional_done"] is True
+
+
+def test_untruncated_done_is_not_provisional(runner):
+    runner.state["decision"] = decision("DONE")
+    act(runner)
+    assert runner.state["status"] == "done"
+    assert runner.state["provisional_done"] is False
+
+
+def test_truncated_done_with_omitted_actions_is_accepted_when_checks_are_declared(runner):
+    runner.state["page"]["omitted_actions"] = 3
+    runner.checks = [{"kind": "url_contains", "value": "example"}]
+    runner.state["decision"] = decision("DONE")
+    act(runner)
+    assert runner.state["status"] == "done"
+    assert runner.state["provisional_done"] is True
+
+
+def test_empty_checks_do_not_accept_truncated_done(runner):
+    runner.state["page"]["text_truncated"] = True
+    runner.checks = []
+    runner.state["decision"] = decision("DONE")
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    assert caught.value.reason == "truncated_done"
+
+
+def test_blocked_without_omitted_actions_is_still_blocked(runner):
+    runner.state["page"]["text_truncated"] = True
+    runner.state["page"]["omitted_actions"] = 0
+    runner.state["decision"] = decision("BLOCKED")
+    act(runner)
+    assert runner.state["status"] == "blocked"
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_wait_dispatch_is_not_dispatched(runner):
+    for _ in range(2):
+        runner.state["decision"] = decision("wait")
+        act(runner)
+    assert {row["dispatch"] for row in runner.state["history"]} == {"not_dispatched"}
+
+
+def test_needs_review_handoff_omits_goal_values_and_page_text(runner, monkeypatch):
+    secret = "417 Sunset Road, Apt 9"
+    monkeypatch.setattr(loop, "bind_value", Mock(return_value={**binding("address"), "confidence": 0.1}))
+    runner.values = {"address": secret}
+    runner.confidence = {"binding": 0.9}
+    runner.state["page"]["text"] = "secret page body"
+    with pytest.raises(NeedsReview) as caught:
+        act(runner)
+    blob = json.dumps(caught.value.handoff)
+    assert secret not in blob
+    assert "secret page body" not in blob
+    assert "Find a book" not in blob
+    assert "page_key" not in blob

@@ -124,6 +124,13 @@ class InstallBehaviour(TempDestTestCase):
         # The path runner.py computes for the contract, resolved in the copy.
         self.assertTrue((runner.parent.parent / "src" / "jev" / "checks.py").is_file())
         self.assertIn('"src" / "jev" / "checks.py"', runner.read_text())
+        # The confidence cutoffs are the same arrangement: one file, two
+        # boundaries, loaded by path from the runtime.
+        cutoffs = skill / "src" / "jev" / "confidence.py"
+        self.assertTrue(cutoffs.is_file(), "src/jev/confidence.py was not installed")
+        self.assertEqual(cutoffs.read_bytes(),
+                         (install.SOURCE / "jev" / "src" / "jev" / "confidence.py").read_bytes())
+        self.assertIn('"src" / "jev" / "confidence.py"', runner.read_text())
 
     def test_copy_drops_local_state(self):
         junk = self.tmp / "junk"

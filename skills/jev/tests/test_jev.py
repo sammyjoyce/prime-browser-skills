@@ -338,6 +338,36 @@ class ValidationTests(FakeRunnerTestCase):
         self.assertFalse((self.home / "artifacts").exists())
         self.assertFalse((self.home / "profiles").exists())
 
+    def test_confidence_must_be_a_map_of_gate_cutoffs(self):
+        bad = [
+            [], "x", 5, True, 0.8, {"op": 0.8}, {"": 0.8}, {5: 0.8},
+            {"operation": 0}, {"operation": -0.1}, {"operation": 1.1},
+            {"operation": True}, {"operation": "0.8"}, {"operation": None},
+            {"operation": [0.8]}, {"operation": float("nan")},
+            {"operation": float("inf")}, {"target": 0.8, "binding": 0},
+        ]
+        for value in bad:
+            with self.subTest(confidence=repr(value)[:40]):
+                self._assert_invalid(
+                    lambda: run("t", "https://example.test", confidence=value)
+                )
+
+    def test_confidence_boundaries_are_accepted_and_sent_verbatim(self):
+        for policy in ({}, {"operation": 1.0}, {"binding": 1e-9},
+                       {"operation": 0.8, "target": 0.85, "binding": 0.9}):
+            with self.subTest(confidence=policy):
+                request = self.go(confidence=policy)["output"]["request"]
+                self.assertEqual(request["confidence"], policy)
+
+    def test_no_confidence_means_no_cutoff_in_the_request(self):
+        request = self.go()["output"]["request"]
+        self.assertIsNone(request["confidence"])
+
+    def test_no_run_starts_for_invalid_confidence(self):
+        with self.assertRaises(JevValidationError):
+            asyncio.run(run("t", "https://example.test", confidence={"operation": 0}))
+        self.assertEqual(self.find_pidfiles(), [])
+
     def test_generation_must_be_helper_or_disabled(self):
         for bad in ["auto", "", "HELPER", 1, True, ["helper"], {"mode": "helper"}]:
             with self.subTest(generation=bad):
@@ -477,6 +507,10 @@ class SuccessPathTests(FakeRunnerTestCase):
             request = asyncio.run(login())["output"]["request"]
         self.assertNotIn("values", request)
         self.assertNotIn("generation", request)
+        self.assertNotIn("checks", request)
+        # login makes no model call and dispatches no agent input, so there is
+        # nothing for a cutoff to gate.
+        self.assertNotIn("confidence", request)
 
     def test_actions_report_which_value_was_used(self):
         result = self.go(values={"email": "dana@example.test"})
@@ -596,6 +630,21 @@ class SuccessPathTests(FakeRunnerTestCase):
         self.assertNotIn(SECRET, json.dumps(payload))
         self.assertIn(jev._REDACTED, payload["checks"][0]["observed"]["value"])
         self.assertIn(jev._REDACTED, payload["checked_at_url"])
+
+    def test_confidence_policy_is_echoed_and_safety_keys_pass_through(self):
+        with self.mode("safety_extras"):
+            result = self.go(confidence={"operation": 0.8})
+        self.assertEqual(result["confidence_policy"], {"operation": 0.8})
+        self.assertEqual(result["side_effects"], "uncertain")
+        self.assertEqual(result["observation"]["viewport"], {"w": 1120, "h": 780})
+        self.assertIs(result["observation"]["text_truncated"], False)
+        self.assertIsNone(result["handoff"])
+
+    def test_a_result_without_the_safety_keys_still_parses(self):
+        # Back-compat: a runner that predates these keys is not a protocol error.
+        result = self.go()
+        for key in ("observation", "side_effects", "handoff", "confidence_policy"):
+            self.assertIsNone(result[key])
 
     def test_login_declares_no_check(self):
         with self.mode("login_ok"):
@@ -873,6 +922,44 @@ class FailurePathTests(FakeRunnerTestCase):
                                  checks=declared)
         self.assertIn(".fingerprint does not name the check", err.message)
         self.assertEqual(err.result["status"], "completed")
+
+    def test_needs_review_raises_with_a_safe_handoff_and_partial_result(self):
+        with self.mode("needs_review"), self.assertRaises(JevError) as ctx:
+            self.go(task="fill the form", values={"email": "dana@example.test"},
+                    confidence={"operation": 0.8})
+        error = ctx.exception
+        self.assertEqual(error.status, "needs_review")
+        self.assertNotIsInstance(error, jev.JevTimeoutError)
+        result = error.result
+        self.assertEqual(result["stop_reason"], "needs_review")
+        self.assertEqual(result["steps"], 1)
+        self.assertIs(result["output"]["completion_claimed"], False)
+        self.assertEqual(result["side_effects"], "none_observed")
+        handoff = result["handoff"]
+        self.assertEqual(handoff["reason"], "low_operation_confidence")
+        self.assertEqual(handoff["input_dispatched"], "not_dispatched")
+        self.assertEqual(
+            handoff["resume_policy"],
+            "inspect current state; never replay this decision or any uncertain input",
+        )
+        blob = json.dumps(result["handoff"])
+        for forbidden in ("dana@example.test", "fill the form", "form page", "page_key"):
+            self.assertNotIn(forbidden, blob)
+        self.assertEqual(result["actions"][0]["dispatch"], "not_dispatched")
+        self.assertEqual(result["actions"][0]["operation_confidence"], 0.44)
+        self.assertIsNone(result["actions"][0]["binding_confidence"])
+
+    def test_a_completed_run_must_not_carry_a_handoff(self):
+        with self.mode("handoff_on_completed"), self.assertRaises(jev.JevProtocolError) as ctx:
+            self.go()
+        self.assertIn("handoff", ctx.exception.message)
+
+    def test_side_effects_can_never_be_confirmed(self):
+        for mode in ("side_effects_confirmed", "side_effects_junk"):
+            with self.subTest(mode=mode), self.mode(mode):
+                with self.assertRaises(jev.JevProtocolError) as ctx:
+                    self.go()
+                self.assertIn("side_effects", ctx.exception.message)
 
     def test_completed_without_a_real_png_is_an_artifact_error(self):
         for mode, fragment in {"noshot": "null",

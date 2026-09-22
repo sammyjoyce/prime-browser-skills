@@ -73,11 +73,14 @@ attempt stopped on an invalid helper value. Neither failure is automatically ret
 treated as success.
 
 A successful result has `status="completed"`, `output`, `text`, `steps`, `cost`,
-`usage`, `screenshot_path`, `verification`, `artifact_dir`, `profile_dir`, model
-identifiers, warnings, and timing data. Paths are absolute. `output` contains the final
-URL, title, page text, `completion_claimed`, and `verification="not_performed"`.
+`usage`, `screenshot_path`, `verification`, `observation`, `side_effects`, `handoff`,
+`confidence_policy`, `artifact_dir`, `profile_dir`, model identifiers, warnings, and
+timing data. Paths are absolute. `output` contains the final URL, title, page text,
+`completion_claimed`, and `verification="not_performed"`.
 `result["verification"]` is a different field: the scoped DOM evidence described in
 "Declared DOM checks" below, and `"not_run"` unless you declare checks.
+`observation`, `side_effects` and `handoff` are described in "Confidence cutoffs and
+stopping for review" below.
 
 **Completed does not mean independently verified.** It means Jev chose DONE, the
 screenshot was saved and cleanup succeeded. Check the actual postcondition before
@@ -99,6 +102,11 @@ except jev.JevError as error:
 
 Do not repeat an uncertain submission. Inspect the state first. A switch to Astra is
 an explicit handoff, not an automatic restart of the original task.
+
+`status="needs_review"` means Jev withheld the next input on purpose. Read
+`error.result["handoff"]` and `error.result["side_effects"]`, look at the page, and
+decide yourself. Never replay the same decision, and never assume nothing was sent
+when `handoff["input_dispatched"]` is `"unknown"`.
 
 ## Exact field values
 
@@ -146,6 +154,11 @@ Each entry in `result["actions"]` carries two more fields:
 - `value_key`: the supplied key that was used, or None.
 - `value_source`: `"supplied"`, `"helper"`, `"skipped"`, or None for actions that are
   not fills.
+
+Every row also reports `operation_confidence`, `target_confidence` (None for operations
+with no target), `binding_confidence` (None when no bind ran) and `dispatch`
+(`"not_dispatched"`, `"attempted"` or `"unknown"`). `confidence` keeps its old meaning,
+the operation score.
 
 The typed text stays out of the result, as before.
 
@@ -271,6 +284,111 @@ contract's own constants. A result that widens any of them, for example a row cl
   protocol, and outer-timeout results do the same, using the same scoped rows
   the runner would, rather than omitting the object.
 
+## Confidence cutoffs and stopping for review
+
+Jev's executor scores each choice it makes. You can declare a cutoff below which it
+must not act. The numbers below are an illustrative example, not a recommended
+setting: they are your policy, not a measured success rate, and this skill ships no
+default.
+
+```python
+result = await jev.run(
+    "Open the feedback form, fill it from the supplied values, then submit it.",
+    url="https://your-approved-app.example/feedback",
+    values={"reviewer_name": "Ada Lovelace"},
+    confidence={"operation": 0.8, "target": 0.85, "binding": 0.9},  # illustrative
+)
+```
+
+The three gates are independent and each one is optional:
+
+- `operation`: the score for the chosen operation (CLICK, TYPE_TEXT, SELECT, ...).
+- `target`: the score for the chosen element. Operations with no target (WAIT, SCROLL,
+  DONE, BLOCKED) skip it.
+- `binding`: the score for the supplied value bound to a field, including the answer
+  "no supplied value fits". A low-confidence "none" is withheld, not silently skipped.
+
+Each value is a finite number greater than 0 and at most 1. `None` and `{}` both mean
+"record the scores and withhold nothing". An absent key leaves that gate off. A bad
+value raises `jev.JevValidationError` before any process starts, and the runtime
+validates the same policy again.
+
+A cutoff can only withhold. It never grants authority: `generation="disabled"` still
+skips, freshness still applies, an unbound field is still skipped, the cost stop still
+fires, and `output["verification"]` is still `"not_performed"`. A high score is not
+evidence that the action was correct.
+
+When a gate withholds, the run stops with `status="needs_review"` and raises
+`jev.JevError`. The partial result is on `error.result`, the step is recorded with
+`dispatch="not_dispatched"`, and nothing was typed or clicked for it.
+
+`needs_review` also covers cases that do not need a cutoff, and three of them changed
+what earlier versions reported:
+
+- A DONE or a BLOCKED claimed on truncated evidence (was `completed` or `blocked`).
+- An interrupted dropdown or any other failure after input was sent, where dispatch
+  cannot be confirmed (was `browser_error`).
+- A page that went stale while being re-observed after input was sent (was
+  `browser_error`).
+
+A freshness failure *before* input is not one of these. Nothing was sent, so Jev simply
+observes again and chooses again, exactly as before.
+
+`result["handoff"]` is a small record of the unresolved decision the executor
+stopped on, for you to read before re-planning. It is present when a decision was
+withheld, a budget stop fired, dispatch was interrupted, truncated DONE or BLOCKED
+was refused, or another `needs_review` case left work unfinished. It is `None`
+when there is no such decision to describe: a completed run; a failure that
+stopped before the agent observed a page; or a DONE that later failed only at
+screenshot capture or cleanup. A later capture or cleanup failure does not invent
+a withheld decision after DONE.
+
+The record looks like this:
+
+```python
+{"reason": "low_binding_confidence", "choice": "e3", "operation": "TYPE_TEXT",
+ "operation_confidence": 0.91, "target": "2", "target_confidence": 0.88,
+ "binding_key": "email", "binding_confidence": 0.40,
+ "observation": {"omitted_actions": 0, "text_truncated": True,
+                 "viewport": {"w": 1120, "h": 780}, "fingerprint": "..."},
+ "input_dispatched": "not_dispatched",
+ "resume_policy": "inspect current state; never replay this decision or any uncertain input"}
+```
+
+It carries stable ids, scores and flags only. No task, no supplied value, no field
+label, no page text, no screenshot, no browser session id. It is not a resumable
+session: a later `jev.run` on the same profile is a new process, a new observation and
+a new decision. Never replay the decision, and never replay an input whose dispatch
+is uncertain; inspect the current page first.
+
+### What Jev saw, and what it may have changed
+
+`result["observation"]` describes the last page the executor observed:
+
+- `omitted_actions`: in-viewport controls dropped by the 250-action cap. Scrolling does
+  not recover them; they were already in view.
+- `text_truncated`: the visible text hit the 6000-character cap and more visible text
+  existed. The snapshot computes this in the browser; it is not guessed from the length.
+- `viewport` and `fingerprint`.
+
+Truncation does not stop ordinary work. Clicks, fills, selects, scrolls and waits still
+run on a truncated page. What it does stop is a completion claim built on it: if Jev
+reports DONE while `text_truncated` or `omitted_actions` says the evidence was cut, the
+run is `needs_review` unless you declared DOM checks and every one of them passed. A
+BLOCKED verdict with omitted actions is always `needs_review`, because a cut action list
+is not proof that nothing on the page could help.
+
+`result["side_effects"]` is `"none_observed"` or `"uncertain"`, never `"confirmed"`:
+
+- `none_observed`: no click, fill, select or scroll reached the page after a passing
+  freshness check. Waits and skipped fills stay in this state.
+- `uncertain`: at least one input was dispatched, or one dispatch could not be
+  confirmed. A fill whose value reads back correctly is still `uncertain`.
+
+This is about dispatched input, not about a server. A page can call an endpoint while
+loading, so `none_observed` is not a promise that nothing happened anywhere, and
+`uncertain` is not proof that anything was saved. Read the saved state back yourself.
+
 ## Screenshots in the main session
 
 Every completed run captures a native PNG directly through Chrome CDP. It is not a
@@ -310,9 +428,10 @@ sharing a name does not transfer authentication or in-progress actions.
 
 - Defaults: 25 actions, 120 seconds, soft model-cost limit $0.50. Upstream safety limits
   can stop a task sooner. The wrapper allows bounded artifact capture and cleanup time.
-- Cost includes Jev, the text helper and each value-binding call. Limits are checked
-  once per action and may overshoot by the requests of one action: a single fill action
-  can issue up to three requests, the decision call, the bind call and the helper call.
+- Cost includes Jev, the text helper and each value-binding call. The budget is checked
+  after every model call and before any input, so an uncosted or over-budget call cannot
+  bind a value, call the text helper or type. What can still overshoot is the one
+  request already in flight, including the retries the upstream client makes inside it.
   Missing usage is unknown, never free; an unaccounted successful provider call stops
   execution rather than continuing without a budget.
 - `model` records the requested decision model; `resolved_model` records the returned
@@ -337,7 +456,8 @@ child = await rlm.spawn(
     "URL, with a unique profile and explicit time/step/cost limits. Do not submit forms. "
     "Check the final URL and visible heading, then send the result, verification evidence, "
     "cost, and absolute screenshot path to the parent with agent_message.send. "
-    "Report JevError with its actual status/message; do not retry uncertain actions.",
+    "Report JevError with its actual status/message; on needs_review report the handoff "
+    "and side_effects instead of retrying; do not retry uncertain actions.",
     name="jev-browser-task",
     thinking="high",
 )
@@ -359,7 +479,12 @@ The declared-check group runs against real headless Chrome and makes no model ca
 
 ```sh
 uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group guards
 ```
+
+Both groups start their own headless Chrome on a throwaway profile with a private
+browser-harness daemon, and neither touches the user's own Chrome. The `guards` group
+measures the snapshot's truncation and action-cap metadata in that browser.
 
 That file records commands, evidence and any remaining gaps; it must not label planned
 tests as passed. From a fresh Prime Agent session in another directory, verify native

@@ -139,6 +139,75 @@ def main():
         assert next(a for a in page["actions"] if a["kind"] == "fill")["value"] == ""
         passed.append("an empty value clears the field and fires a real input event")
 
+        tiny = "font-size:1px;line-height:1px;word-break:break-all;margin:0"
+        browser.evaluate("document.body.innerHTML=" + repr(f'<p style="{tiny}">{"a" * 20}</p>'))
+        page = browser.observe(screenshot=False)
+        assert page["text_truncated"] is False, repr(page.get("text_truncated"))
+        assert len(page["text"]) == 20
+        passed.append("20 visible characters are not truncated")
+
+        browser.evaluate("document.body.innerHTML=" + repr(f'<p style="{tiny}">{"b" * 6000}</p>'))
+        page = browser.observe(screenshot=False)
+        assert page["text_truncated"] is False, "exactly 6000 visible characters is not truncated"
+        assert len(page["text"]) == 6000
+        passed.append("exactly 6000 visible characters is not truncated")
+
+        browser.evaluate("document.body.innerHTML=" + repr(f'<p style="{tiny}">{"c" * 7000}</p>'))
+        page = browser.observe(screenshot=False)
+        assert page["text_truncated"] is True
+        assert len(page["text"]) == 6000
+        passed.append("7000 visible characters set text_truncated and cap text at 6000")
+
+        browser.evaluate(
+            "document.body.innerHTML="
+            + repr(f'<p style="{tiny}">{"d" * 6000}</p><p style="{tiny}">more</p>')
+        )
+        page = browser.observe(screenshot=False)
+        assert page["text_truncated"] is True
+        assert len(page["text"]) == 6000
+        passed.append("an extra in-view text node after 6000 sets text_truncated")
+
+        browser.evaluate(
+            "document.body.innerHTML="
+            + repr(
+                f'<p style="{tiny}">{"e" * 6000}</p>'
+                '<p style="display:none">hidden trailing visible-looking text</p>'
+                "<p hidden>also hidden</p>"
+            )
+        )
+        page = browser.observe(screenshot=False)
+        assert page["text_truncated"] is False, "hidden trailing nodes must not set text_truncated"
+        assert len(page["text"]) == 6000
+        passed.append("hidden trailing nodes do not set text_truncated")
+
+        buttons = "".join(
+            f'<button class="g" style="left:{16 * (i % 60)}px;top:{16 * (i // 60)}px">{i}</button>'
+            for i in range(251)
+        )
+        browser.evaluate(
+            "document.body.innerHTML="
+            + repr(
+                '<style>button.g{position:absolute;width:14px!important;height:14px!important;'
+                "padding:0;margin:0;font-size:8px;border:0}</style>"
+                f'<div style="position:relative;width:1000px;height:90px">{buttons}</div>'
+            )
+        )
+        page = browser.observe(screenshot=False)
+        element_actions = [a for a in page["actions"] if str(a.get("id", "")).startswith("e")]
+        waits = [a for a in page["actions"] if a.get("id") == "wait"]
+        scrolls = [a for a in page["actions"] if a.get("kind") == "scroll"]
+        assert page["omitted_actions"] == 1, page["omitted_actions"]
+        assert len(element_actions) == 250, len(element_actions)
+        assert len(waits) == 1
+        assert len(page["actions"]) == 250 + len(waits) + len(scrolls)
+        passed.append(
+            f"251 in-view controls: omitted_actions=1 capped=250 wait={len(waits)} scroll={len(scrolls)}"
+        )
+
+        browser.evaluate("document.body.innerHTML=" + repr('<label>Search <input id="query" value="keep"></label>'))
+        page = browser.observe(screenshot=False)
+        field = next(a for a in page["actions"] if a["kind"] == "fill")
+
         browser.call("Page.navigate", url="about:blank")
         assert not browser.fresh(page, field)
         passed.append("navigation invalidates the old document")

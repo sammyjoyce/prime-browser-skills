@@ -12,16 +12,19 @@ This repository is MIT licensed, see `LICENSE`. The items below have their own t
 | Archive sha256 | `3bed2171ef064135c5192bad354b4a187f71ec397639d5ab676d02be37822211` |
 | License | MIT, retained at `skills/jev/runtime/vendor/jev-ultrafast/LICENSE` |
 | Path here | `skills/jev/runtime/vendor/jev-ultrafast/` |
-| Local changes | Six files, listed in `skills/jev/runtime/vendor/PROVENANCE.md` |
+| Local changes | Seven files, listed in `skills/jev/runtime/vendor/PROVENANCE.md` |
 
-The vendored tree is a maintained fork of that pinned archive, not a plain copy. Six
+The vendored tree is a maintained fork of that pinned archive, not a plain copy. Seven
 files carry local changes: `jev_ultrafast/agent.py`, `jev_ultrafast/model.py`,
-`jev_ultrafast/questions.py`, `jev_ultrafast/browser.py`, `scripts/check_guards.py` and
-`tests/test_agent.py`. They add exact-value binding, let a null text-helper answer skip a
-field instead of ending the run, clear a field with a Delete key event, and add a fixture
-check that an empty value clears the field and fires an input event. Every other retained
-file is byte-identical to the archive. The MIT license and upstream copyright notice are
-kept with the source.
+`jev_ultrafast/snapshot.js`, `jev_ultrafast/questions.py`, `jev_ultrafast/browser.py`,
+`scripts/check_guards.py` and `tests/test_agent.py`. They add exact-value binding, let a
+null text-helper answer skip a field instead of ending the run, clear a field with a
+Delete key event, report whether the snapshot's visible text was truncated and tell the
+decision and binding calls, withhold input for a low confidence score, an unpaid budget
+or an uncertain dispatch, and add the matching fixture and snapshot checks. Every other
+retained file is byte-identical to the archive. The MIT license and upstream copyright
+notice are kept with the source. `skills/jev/runtime/vendor/PROVENANCE.md` lists the
+seven files and gives both ways to reproduce that list.
 
 This published copy omits two upstream paths:
 
@@ -36,8 +39,8 @@ archive.
 
 The `jev` skill also adapts upstream behaviour at runtime. Each runtime adaptation is
 listed in the `DEVIATIONS` constant in `skills/jev/runtime/runner.py` and is returned
-with each result under `deviations`. That list carries a `fork:` entry naming the two
-in-tree behaviour changes as well.
+with each result under `deviations`. That list carries a `fork:` entry naming the in-tree
+behaviour changes as well.
 
 ## Dependencies
 

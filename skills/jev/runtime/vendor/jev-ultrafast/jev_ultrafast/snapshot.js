@@ -80,16 +80,20 @@
     }
   }
   const words=[], walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
-  const range=document.createRange(); let node,length=0;
-  while ((node=walker.nextNode()) && length<6000) {
+  const range=document.createRange(); let node,length=0,text_truncated=false;
+  while ((node=walker.nextNode())) {
     const value=node.textContent.trim(), parent=node.parentElement;
     if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
     range.selectNodeContents(node); const r=range.getBoundingClientRect();
-    if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth) {
-      words.push(value); length+=value.length;
-    }
+    if (!(r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth)) continue;
+    // Another in-view text node after the cap is real truncation. Hidden or off-screen
+    // trailing nodes do not set the flag. A page of exactly 6000 visible characters is not truncated.
+    if (length>=6000) { text_truncated=true; break; }
+    words.push(value); length+=value.length;
   }
-  const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
+  const joined=words.join('\n');
+  if (joined.length>6000) text_truncated=true;
+  const text=joined.slice(0,6000), height=document.documentElement.scrollHeight;
   const page_key=cache.pageKey(), guards={};
   for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
@@ -103,5 +107,5 @@
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
+    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,text_truncated};
 })()

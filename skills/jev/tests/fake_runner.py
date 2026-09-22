@@ -225,6 +225,65 @@ def ok_result(req, art, **overrides):
     return result
 
 
+def safety_for(req, **overrides):
+    """Plausible safety metadata: observation, side effects, handoff, policy.
+
+    The real runtime builds these from the last page and the agent's history.
+    The fake builds a withheld-input case so the wrapper's own rules (no
+    "confirmed", no handoff on a completed run) have something to inspect.
+    """
+    payload = {
+        "observation": {"omitted_actions": 0, "text_truncated": False,
+                        "viewport": {"w": 1120, "h": 780}, "fingerprint": "a" * 64},
+        "side_effects": "none_observed",
+        "handoff": None,
+        "confidence_policy": req.get("confidence"),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def needs_review_result(req, **overrides):
+    """A withheld-input stop: partial result, handoff, no completion claim."""
+    result = {
+        "status": "needs_review",
+        "stop_reason": "needs_review",
+        "error": ("the executor withheld the next input; inspect the current page before any "
+                  "retry and do not replay this decision or any uncertain input"),
+        "text": "jev stopped for review after 1 action(s)",
+        "steps": 1,
+        "cost": 0.004,
+        "screenshot_path": None,
+        "output": {"final_url": "https://example.test/form", "final_title": "Form",
+                   "page_text": "form page", "completion_claimed": False,
+                   "verification": "not_performed", "request": req},
+        "actions": [
+            {"step": 1, "kind": "fill", "action": "Email", "operation": "TYPE_TEXT",
+             "probability": 0.9, "confidence": 0.44, "page_changed": False,
+             "value_key": "email", "value_source": None,
+             "operation_confidence": 0.44, "target_confidence": 0.91,
+             "binding_confidence": None, "dispatch": "not_dispatched"},
+        ],
+        "verification": verification_for(req),
+    }
+    result.update(safety_for(req, handoff={
+        "reason": "low_operation_confidence",
+        "choice": "e1",
+        "operation": "TYPE_TEXT",
+        "operation_confidence": 0.44,
+        "target": "1",
+        "target_confidence": 0.91,
+        "binding_key": None,
+        "binding_confidence": None,
+        "observation": {"omitted_actions": 0, "text_truncated": True,
+                        "viewport": {"w": 1120, "h": 780}, "fingerprint": "b" * 64},
+        "input_dispatched": "not_dispatched",
+        "resume_policy": "inspect current state; never replay this decision or any uncertain input",
+    }))
+    result.update(overrides)
+    return result
+
+
 def spawn_child(art, name, seconds=60):
     """Fork a long-lived SIGTERM-ignoring descendant in the runner's group."""
     pid = os.fork()
@@ -439,6 +498,22 @@ def main():
         emit(ok_result(req, art, screenshot_path=None,
                        verification=twist_verification(verification_for(req),
                                                        "foreign_declaration")))
+        return
+    if mode == "needs_review":
+        emit(needs_review_result(req))
+        return
+    if mode == "safety_extras":
+        emit(ok_result(req, art, **safety_for(req, side_effects="uncertain")))
+        return
+    if mode == "handoff_on_completed":
+        payload = needs_review_result(req)
+        emit(ok_result(req, art, handoff=payload["handoff"]))
+        return
+    if mode == "side_effects_confirmed":
+        emit(ok_result(req, art, **safety_for(req, side_effects="confirmed")))
+        return
+    if mode == "side_effects_junk":
+        emit(ok_result(req, art, **safety_for(req, side_effects=["uncertain"])))
         return
     if mode == "verified":
         emit(ok_result(req, art, verified=True))

@@ -10,8 +10,8 @@ Operations
 
 The package in vendor/jev-ultrafast is a maintained fork of upstream pin
 1231850a0bf1a0c0341fe408ef1668dbbfdfac46, not an untouched copy; every local
-change to it is listed in vendor/PROVENANCE.md. Five further adaptations are
-applied in-process. All six differences from upstream, the fork included, are
+change to it is listed in vendor/PROVENANCE.md. Six further adaptations are
+applied in-process. All seven differences from upstream, the fork included, are
 listed in DEVIATIONS.
 """
 
@@ -45,18 +45,30 @@ PROC_T0 = time.perf_counter()
 # again, with the same code, so the two boundaries cannot drift apart.
 # install.py copies src/ and runtime/ together, so both are always present.
 CHECKS_MODULE_PATH = Path(__file__).resolve().parent.parent / "src" / "jev" / "checks.py"
+# The confidence-cutoff contract is the same arrangement: one file, validated in
+# the wrapper before this process exists and again here.
+CONFIDENCE_MODULE_PATH = Path(__file__).resolve().parent.parent / "src" / "jev" / "confidence.py"
 
 
-def load_checks_module(path=CHECKS_MODULE_PATH):
-    spec = importlib.util.spec_from_file_location("jev_declared_checks", path)
+def load_contract_module(module_name, path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"the declared-check contract could not be loaded from {path}")
+        raise ImportError(f"the contract module {module_name} could not be loaded from {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
+def load_checks_module(path=CHECKS_MODULE_PATH):
+    return load_contract_module("jev_declared_checks", path)
+
+
+def load_confidence_module(path=CONFIDENCE_MODULE_PATH):
+    return load_contract_module("jev_confidence_policy", path)
+
+
 dom_checks = load_checks_module()
+confidence_policy_contract = load_confidence_module()
 
 UPSTREAM_COMMIT = "1231850a0bf1a0c0341fe408ef1668dbbfdfac46"
 UPSTREAM_SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone"
@@ -97,11 +109,19 @@ DEVIATIONS = [
     "JavaScript read through the upstream Browser.evaluate after the agent generator is closed, "
     "and reports it as result['verification'] with scope 'declared_dom_checks_only'. The page is "
     "never written to, the agent loop never sees it, and no check changes the run's status.",
+    "safety: the runner passes the caller's confidence cutoffs and a budget callback into the "
+    "vendored agent. The callback runs after every model call and before any input, so an "
+    "uncosted or over-budget call stops the run before it binds a value, calls the text helper "
+    "or types, and a decision below a declared cutoff is withheld as needs_review. It also "
+    "refuses to call a run completed when the executor claimed DONE on an observation the "
+    "snapshot reported as truncated and the declared DOM checks did not all pass.",
     "fork: vendor/jev-ultrafast is a maintained fork of the upstream pin, not an untouched copy. "
-    "Two behaviours differ from upstream: a caller-supplied value is bound to a field by one "
-    "TypeSafe choice and typed byte for byte, and a text helper that answers {\"text\": null} now "
-    "skips the field instead of ending the run. Every local change is listed in "
-    "vendor/PROVENANCE.md.",
+    "Four behaviours differ from upstream: a caller-supplied value is bound to a field by one "
+    "TypeSafe choice and typed byte for byte, a text helper that answers {\"text\": null} now "
+    "skips the field instead of ending the run, the snapshot reports whether its visible text was "
+    "truncated and the decision and binding calls are told, and the agent withholds input for a "
+    "low confidence score, an unpaid budget or an uncertain dispatch instead of continuing. "
+    "Every local change is listed in vendor/PROVENANCE.md.",
 ]
 
 # Statuses. Only "completed" means DONE plus a native PNG plus successful cleanup.
@@ -118,6 +138,9 @@ ARTIFACT_ERROR = "artifact_error"
 CLEANUP_ERROR = "cleanup_error"
 PROFILE_BUSY = "profile_busy"
 PROTOCOL_ERROR = "protocol_error"
+# The executor stopped because the next input was not safe to take. A partial
+# result is present, and the caller must inspect the page before any retry.
+NEEDS_REVIEW = "needs_review"
 CREDENTIALS_ERROR = "credentials_error"
 LAUNCH_ERROR = "launch_error"
 INTERNAL_ERROR = "internal_error"
@@ -308,6 +331,19 @@ def declared_dom_checks(value):
         raise RequestError(str(exc)) from None
 
 
+def confidence_cutoffs(value):
+    """The caller's opt-in confidence cutoffs, or None.
+
+    The same contract module the wrapper uses, re-validated here: a runner
+    never trusts its caller. None and {} both mean "record the scores and
+    withhold nothing". There is no default cutoff.
+    """
+    try:
+        return confidence_policy_contract.normalize_confidence(value)
+    except confidence_policy_contract.ConfidenceError as exc:
+        raise RequestError(str(exc)) from None
+
+
 def normalize(request):
     op = request.get("op")
     if op not in {"run", "login"}:
@@ -335,6 +371,7 @@ def normalize(request):
         config["values"] = supplied_values(request.get("values"))
         config["generation"] = generation_mode(request.get("generation"), config["values"])
         config["checks"] = declared_dom_checks(request.get("checks"))
+        config["confidence"] = confidence_cutoffs(request.get("confidence"))
     else:
         config["task"] = None
         config["max_steps"] = None
@@ -343,6 +380,9 @@ def normalize(request):
         config["generation"] = None
         # login opens a window for a person; it asserts nothing about a page.
         config["checks"] = []
+        # login makes no model call and dispatches no agent input, so a cutoff
+        # would have nothing to gate.
+        config["confidence"] = None
     return config
 
 
@@ -1160,6 +1200,14 @@ def base_result(config):
         # Declared DOM checks, filled in by run_operation or finalize. Never
         # the same field as output["verification"], which stays "not_performed".
         "verification": None,
+        # Safety metadata. observation/side_effects/handoff stay null until the
+        # agent exists: a run that failed before launch has nothing to describe
+        # and must not invent an observation. confidence_policy is the policy
+        # that was applied, known from the request, never a measured accuracy.
+        "observation": None,
+        "side_effects": None,
+        "handoff": None,
+        "confidence_policy": config.get("confidence") if config["op"] == "run" else None,
         "upstream_commit": UPSTREAM_COMMIT,
         "deviations": list(DEVIATIONS),
     }
@@ -1226,6 +1274,10 @@ def classify(exc):
             return PROVIDER_ERROR
     if isinstance(exc, RuntimeError) and message.startswith("Model "):
         return PROVIDER_ERROR
+    # The executor withheld the next input on purpose. It is not a browser
+    # failure, and the caller must inspect the page instead of retrying.
+    if name == "NeedsReview":
+        return NEEDS_REVIEW
     if name == "StalePage":
         return BROWSER_ERROR
     return BROWSER_ERROR
@@ -1288,6 +1340,7 @@ def run_operation(config, owned, result):
     install_provider_patch()
 
     from jev_ultrafast import Agent
+    from jev_ultrafast.agent import NeedsReview
 
     check_stop()
     start_private_daemon(owned, artifact_dir, os.environ["BU_NAME"])
@@ -1295,12 +1348,38 @@ def run_operation(config, owned, result):
 
     # Count only: a supplied value is never written to stderr, the result, or an artifact.
     log(f"supplied_values={len(config['values'] or {})} generation={config['generation']}")
+    log(f"confidence_policy={sorted(config['confidence'] or {})} checks={len(config['checks'] or [])}")
+
+    def budget_guard():
+        """Called inside the agent after each model call and before any input.
+
+        An uncosted or over-budget call therefore cannot bind a value, cannot
+        call the text helper and cannot type. The overshoot is what the
+        upstream retry policy may already have spent inside the one logical
+        call that is in flight, which is up to three HTTP attempts, not a bind
+        plus a helper plus a typed field.
+        """
+        check_stop()
+        if successful_attempts_without_cost():
+            raise Stopped(COST_UNKNOWN)
+        if known_cost() > config["max_cost_usd"]:
+            raise Stopped(COST_LIMIT)
+
     agent = Agent(
-        config["url"], config["task"], values=config["values"], generation=config["generation"]
+        config["url"], config["task"], values=config["values"], generation=config["generation"],
+        # None and {} both mean "record the scores, withhold nothing".
+        confidence=config["confidence"],
+        budget_guard=budget_guard,
+        # The A seam. A non-empty list lets the executor take DONE on truncated
+        # evidence, provisionally: this runner still refuses to call that run
+        # completed unless every declared check actually passed, below.
+        checks=config["checks"],
     )
     stop_reason = None
     error = None
     final_state = None
+    handoff = None
+    review_dispatch = None
     try:
         generator = agent.run()
         for state in generator:
@@ -1308,12 +1387,13 @@ def run_operation(config, owned, result):
             steps = len(state["history"])
             log(f"step={steps} status={state['status']} elapsed={state['elapsed_ms']}ms url={state['page']['url'][:80]}")
             check_stop()
-            if state["status"] in {"done", "blocked"}:
+            if state["status"] in {"done", "blocked", "needs_review"}:
                 stop_reason = state["status"]
                 break
             if steps >= config["max_steps"]:
                 stop_reason = MAX_STEPS
                 break
+            # Backstop only: budget_guard already stopped the run before input.
             if successful_attempts_without_cost():
                 stop_reason = COST_UNKNOWN
                 break
@@ -1321,6 +1401,15 @@ def run_operation(config, owned, result):
                 stop_reason = COST_LIMIT
                 break
         generator.close()
+    except NeedsReview as exc:
+        # The executor refused the next input on purpose. That is not a browser
+        # failure, so it must not be classified as one, and the partial history
+        # stays exactly as it was recorded.
+        stop_reason = NEEDS_REVIEW
+        error = None
+        handoff = getattr(exc, "handoff", None)
+        review_dispatch = getattr(exc, "input_dispatched", None)
+        log(f"agent withheld input: {getattr(exc, 'reason', NEEDS_REVIEW)}")
     except Stopped as exc:
         stop_reason = str(exc)
         error = None
@@ -1329,8 +1418,15 @@ def run_operation(config, owned, result):
         stop_reason = "exception"
         log(f"agent raised: {type(exc).__name__}: {exc}")
 
-    if final_state is None:
-        final_state = safe_snapshot(agent)
+    # The generator yields only at the end of a tick, so a raise leaves
+    # final_state describing the previous tick's page. Re-read the agent's
+    # in-memory state so observation and handoff describe the page it stopped
+    # on. snapshot() does not call CDP; safe_snapshot already swallows failures.
+    live_state = safe_snapshot(agent)
+    if live_state is not None:
+        final_state = live_state
+    elif final_state is None:
+        final_state = {}
 
     # Declared DOM checks run here: after execution, before teardown, and
     # before the screenshot, so a capture failure cannot destroy evidence that
@@ -1366,6 +1462,31 @@ def run_operation(config, owned, result):
     page = (final_state or {}).get("page") or {}
     history = (final_state or {}).get("history") or []
     elapsed = (final_state or {}).get("elapsed_ms")
+
+    # A DONE taken on an observation the snapshot itself reported as truncated
+    # is provisional. Declared checks being present is not evidence; only every
+    # declared check actually passing is. A failed, unknown or missing
+    # verification keeps the partial result and stops at needs_review, and the
+    # completion claim below is cleared with it.
+    if stop_reason == "done" and completion_was_provisional(final_state, page):
+        if all_declared_checks_passed(result.get("verification")):
+            result["warnings"].append(
+                "the executor claimed DONE on a truncated observation; every declared DOM check "
+                "passed, which is scoped page evidence only, not proof the whole task finished "
+                "or that a server stored anything"
+            )
+        else:
+            stop_reason = NEEDS_REVIEW
+            # The evidence reason, as an enum. The counts stay where they were
+            # measured, in result["verification"].
+            handoff = {"reason": "truncated_done_checks_not_passed"}
+            review_dispatch = NOT_DISPATCHED
+            result["warnings"].append(
+                "the executor claimed DONE on a truncated observation and the declared DOM checks "
+                "did not all pass; the completion claim was withheld"
+            )
+            log("truncated DONE withheld: declared checks did not all pass")
+
     result["steps"] = len(history)
     result["duration_ms"] = elapsed if elapsed else (None if not history else elapsed)
     result["output"] = {
@@ -1380,18 +1501,216 @@ def run_operation(config, owned, result):
         f"final url {page.get('url')}"
     )
     result["actions"] = action_rows(history)
+
+    # Safety metadata on every path that reached the agent, partial results
+    # included. Only the last observation, never live browser state. With no
+    # page at all there is nothing to describe, and a default observation would
+    # be an invention.
+    result["observation"] = observation_of(page) if page else None
+    result["side_effects"] = side_effects_of(history)
+    if stop_reason == "done":
+        result["handoff"] = None
+    else:
+        if error is not None:
+            # An unclassified upstream failure does not prove where it stopped.
+            dispatched = UNKNOWN_DISPATCH
+        elif review_dispatch is not None:
+            dispatched = review_dispatch
+        else:
+            dispatched = stopping_dispatch(final_state)
+        reason = (handoff or {}).get("reason") or (
+            (final_state or {}).get("review_reason") if stop_reason == NEEDS_REVIEW else stop_reason
+        )
+        fields = dict(decision_fields(final_state))
+        for key in ("choice", "operation", "operation_confidence", "target", "target_confidence",
+                    "binding_key", "binding_confidence"):
+            if isinstance(handoff, dict) and handoff.get(key) is not None:
+                fields[key] = handoff[key]
+        result["handoff"] = build_handoff(reason, page, fields, dispatched)
     return stop_reason, error
 
 
 ACTION_FIELDS = (
     "step", "kind", "action", "operation", "probability", "confidence", "page_changed",
     "value_key", "value_source",
+    # confidence stays the operation score, as in the previous release.
+    # operation_confidence is the same number under a name that matches the others.
+    "operation_confidence", "target_confidence", "binding_confidence", "dispatch",
 )
 
 
 def action_rows(history):
     """Reported actions. Which value was used, never the text that was typed."""
     return [{k: h.get(k) for k in ACTION_FIELDS} for h in history]
+
+
+# --------------------------------------------------------------------------
+# safety metadata: observation, side effects, handoff
+# --------------------------------------------------------------------------
+NOT_DISPATCHED = "not_dispatched"
+ATTEMPTED = "attempted"
+UNKNOWN_DISPATCH = "unknown"
+DISPATCH_VALUES = (NOT_DISPATCHED, ATTEMPTED, UNKNOWN_DISPATCH)
+
+NONE_OBSERVED = "none_observed"
+UNCERTAIN = "uncertain"
+
+RESUME_POLICY = "inspect current state; never replay this decision or any uncertain input"
+# Only these keys, in this order. Nothing else is copied into a handoff.
+HANDOFF_FIELDS = (
+    "reason", "choice", "operation", "operation_confidence", "target", "target_confidence",
+    "binding_key", "binding_confidence", "observation", "input_dispatched", "resume_policy",
+)
+# Stable identifiers the executor produced: action ids, operation names, target
+# indexes, supplied-value keys and reason enums. A label, a task, a page string,
+# a typed value or anything with whitespace cannot match this.
+HANDOFF_ID_RE = re.compile(r"\A[A-Za-z0-9_:.-]{1,120}\Z")
+
+
+def handoff_id(value):
+    """A short stable identifier, or None. Never a label, value or free text."""
+    return value if isinstance(value, str) and HANDOFF_ID_RE.match(value) else None
+
+
+def handoff_score(value):
+    """A finite score in [0, 1], or None. Never a bool and never a string."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and 0 <= value <= 1 else None
+
+
+def observation_of(page):
+    """Allowlisted snapshot metadata for the last page, or None.
+
+    Never page text, element values, page_key, guards or marker: page_key
+    carries live field values, and the marker carries the visible text.
+    """
+    if not isinstance(page, dict):
+        return None
+    omitted = page.get("omitted_actions")
+    viewport = {}
+    for key in ("w", "h"):
+        size = page.get(key)
+        viewport[key] = size if isinstance(size, int) and not isinstance(size, bool) else None
+    return {
+        "omitted_actions": int(omitted) if isinstance(omitted, int) and not isinstance(omitted, bool) else 0,
+        "text_truncated": bool(page.get("text_truncated")),
+        "viewport": viewport,
+        "fingerprint": handoff_id(page.get("fingerprint")),
+    }
+
+
+def side_effects_of(history):
+    """none_observed or uncertain. Never confirmed.
+
+    "none_observed" says no click, fill, select or scroll in this run reached
+    Browser.act after a passing freshness check. It is not a promise that the
+    page produced no backend effect: a navigation alone can load an endpoint.
+    "uncertain" is the answer for anything that reached input, including a fill
+    whose value reads back correctly, because typing proves what was typed and
+    never what was stored. A row whose dispatch cannot be read is uncertain: an
+    unrecognised row is not evidence that nothing was sent.
+    """
+    if not isinstance(history, list):
+        return UNCERTAIN
+    for row in history:
+        if not isinstance(row, dict) or row.get("dispatch") != NOT_DISPATCHED:
+            return UNCERTAIN
+    return NONE_OBSERVED
+
+
+def stopping_dispatch(final_state):
+    """Was input dispatched for the decision this run stopped on?
+
+    A history row is appended only after a decision was consumed, so a decision
+    that dispatched nothing (DONE, a withhold, a budget stop, or a pre-input
+    StalePage, which browser.py raises before any CDP input) leaves fewer rows
+    than decisions. When the counts cannot be read the answer is "unknown",
+    never "not_dispatched": a missing row is not proof that nothing was sent.
+    """
+    if not isinstance(final_state, dict):
+        return UNKNOWN_DISPATCH
+    history = final_state.get("history")
+    decisions = final_state.get("decisions")
+    if not isinstance(history, list) or not isinstance(decisions, list):
+        return UNKNOWN_DISPATCH
+    if not history or len(history) < len(decisions):
+        return NOT_DISPATCHED
+    value = history[-1].get("dispatch") if isinstance(history[-1], dict) else None
+    return value if value in DISPATCH_VALUES else UNKNOWN_DISPATCH
+
+
+def decision_fields(final_state):
+    """Allowlisted scalars from the last decision. Never its request body."""
+    decisions = (final_state or {}).get("decisions") if isinstance(final_state, dict) else None
+    last = decisions[-1] if isinstance(decisions, list) and decisions else None
+    if not isinstance(last, dict):
+        return {}
+    return {
+        "choice": last.get("choice"),
+        "operation": last.get("operation"),
+        "operation_confidence": last.get("confidence"),
+        "target": last.get("target"),
+        "target_confidence": last.get("target_confidence"),
+    }
+
+
+def build_handoff(reason, page, fields=None, input_dispatched=UNKNOWN_DISPATCH):
+    """What a parent model may read before it re-plans. Allowlist only.
+
+    Stable ids, an enum reason, scores, the truncation and viewport flags and
+    the page fingerprint. No task, no supplied values, no labels (an input
+    label can echo a value), no previews, no page text, no screenshot, no
+    page_key, guards or marker, no credentials, no raw provider body and no CDP
+    session or target id. Scalars are validated here; a nested object other
+    than the observation this function builds is never copied in. This is a
+    record to inspect, not a session to resume: the profile directory persists,
+    but a later jev.run is a new process, a new observation and a new decision.
+    """
+    fields = fields if isinstance(fields, dict) else {}
+    handoff = {
+        "reason": handoff_id(reason) or "unknown",
+        "choice": handoff_id(fields.get("choice")),
+        "operation": handoff_id(fields.get("operation")),
+        "operation_confidence": handoff_score(fields.get("operation_confidence")),
+        "target": handoff_id(fields.get("target")),
+        "target_confidence": handoff_score(fields.get("target_confidence")),
+        "binding_key": handoff_id(fields.get("binding_key")),
+        "binding_confidence": handoff_score(fields.get("binding_confidence")),
+        "observation": observation_of(page),
+        "input_dispatched": (
+            input_dispatched if input_dispatched in DISPATCH_VALUES else UNKNOWN_DISPATCH
+        ),
+        "resume_policy": RESUME_POLICY,
+    }
+    return {key: handoff[key] for key in HANDOFF_FIELDS}
+
+
+def all_declared_checks_passed(payload):
+    """True only when every declared DOM check was read and passed.
+
+    Scope is still the declared DOM only: this says the caller's own assertions
+    matched the page, never that the task finished or that a server stored
+    anything.
+    """
+    if not isinstance(payload, dict) or payload.get("status") != "passed":
+        return False
+    rows = payload.get("checks")
+    if not isinstance(rows, list) or not rows or len(rows) != payload.get("declared"):
+        return False
+    return all(isinstance(row, dict) and row.get("status") == "passed" for row in rows)
+
+
+def completion_was_provisional(final_state, page):
+    """True when the executor took DONE on evidence it reported as truncated."""
+    if isinstance(final_state, dict) and final_state.get("provisional_done"):
+        return True
+    if not isinstance(page, dict):
+        return False
+    omitted = page.get("omitted_actions")
+    return bool(page.get("text_truncated")) or bool(
+        isinstance(omitted, int) and not isinstance(omitted, bool) and omitted > 0
+    )
 
 
 def safe_snapshot(agent):
@@ -1476,6 +1795,7 @@ def decide_status(op, stop_reason, error, result, cleanup_ok):
         MAX_STEPS: MAX_STEPS,
         COST_LIMIT: COST_LIMIT,
         COST_UNKNOWN: COST_UNKNOWN,
+        NEEDS_REVIEW: NEEDS_REVIEW,
         "timeout": TIMEOUT,
         "cancelled": CANCELLED,
     }.get(stop_reason, BROWSER_ERROR)
@@ -1486,6 +1806,10 @@ DEFAULT_MESSAGES = {
     MAX_STEPS: "stopped at the requested max_steps",
     COST_LIMIT: "stopped at the requested max_cost_usd",
     COST_UNKNOWN: "a successful model request reported no cost, so the budget could not be enforced",
+    NEEDS_REVIEW: (
+        "the executor withheld the next input; inspect the current page before any retry and do "
+        "not replay this decision or any uncertain input (see result['handoff'])"
+    ),
     TIMEOUT: "the operation exceeded timeout_ms",
     CANCELLED: "the operation was cancelled",
     ARTIFACT_ERROR: "the agent reported DONE but no valid native PNG screenshot exists at an absolute path",
