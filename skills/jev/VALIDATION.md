@@ -259,9 +259,11 @@ changed.
 No live model run exercised any of this. Every case below is deterministic: mocked model
 answers, or a real headless Chrome with no model call at all.
 
-These counts are for this work stacked on the declared-DOM-check layer above, which is
-the tree it now sits in. On its own base the same work measured 85 wrapper tests and 514
-unit checks; those two figures are historical.
+These counts are for this work as it stood on the declared-DOM-check layer before
+that layer's row-fingerprint follow-up and before the four review fixes, so every
+figure in the table below is historical; "Re-run deterministic checks" states the
+current combined totals for this tree. On its own base the same work measured 85
+wrapper tests and 514 unit checks.
 
 | Check | Result |
 |---|---|
