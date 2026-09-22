@@ -224,6 +224,59 @@ class ValidationTests(FakeRunnerTestCase):
         self.assertEqual(request["max_cost_usd"], jev._MAX_COST_USD)
         self.assertEqual(request["timeout_ms"], 30000)  # integral float accepted
 
+    def test_values_must_be_a_short_map_of_strings(self):
+        bad = [
+            [], "x", 5, True, {"email": 5}, {"email": None}, {"email": True},
+            {"email": b"x"}, {"1bad": "x"}, {"": "x"}, {"a-b": "x"}, {"a" * 65: "x"},
+            {5: "x"}, {"email": "x" * (jev._MAX_VALUE_CHARS + 1)},
+            {f"k{i}": "x" for i in range(jev._MAX_VALUES + 1)},
+        ]
+        for values in bad:
+            with self.subTest(values=repr(values)[:40]):
+                self._assert_invalid(lambda: run("t", "https://example.test", values=values))
+
+    def test_value_limits_at_the_boundary_are_accepted(self):
+        values = {f"k{i}": "x" * jev._MAX_VALUE_CHARS for i in range(jev._MAX_VALUES - 1)}
+        values["a" * 64] = ""
+        request = self.go(values=values)["output"]["request"]
+        self.assertEqual(request["values"], values)
+        self.assertEqual(len(request["values"]), jev._MAX_VALUES)
+
+    def test_an_invalid_value_is_never_echoed(self):
+        error = self._assert_invalid(
+            lambda: run("t", "https://example.test", values={"pin": 123456})
+        )
+        self.assertNotIn("123456", error.message)
+        self.assertIn("'pin'", error.message)
+
+    def test_value_key_with_trailing_newline_is_rejected(self):
+        # Python's `$` also matches just before a trailing newline. The wrapper
+        # regex must anchor with \A and \Z so a key like "abc\n" is rejected
+        # here, before any runner process starts, not by the runner later with
+        # a generic invalid_request error.
+        error = self._assert_invalid(
+            lambda: run("t", "https://example.test", values={"abc\n": "x"})
+        )
+        self.assertIn("abc", error.message)
+        self.assertFalse((self.home / "artifacts").exists())
+        self.assertFalse((self.home / "profiles").exists())
+
+    def test_value_key_none_is_reserved(self):
+        # "NONE" is the bind_value sentinel for "no supplied value belongs
+        # here"; a caller key of "NONE" would be silently overwritten and
+        # could never be bound, so the wrapper rejects it up front.
+        error = self._assert_invalid(
+            lambda: run("t", "https://example.test", values={"NONE": "x"})
+        )
+        self.assertIn("NONE", error.message)
+        self.assertFalse((self.home / "artifacts").exists())
+        self.assertFalse((self.home / "profiles").exists())
+
+    def test_generation_must_be_helper_or_disabled(self):
+        for bad in ["auto", "", "HELPER", 1, True, ["helper"], {"mode": "helper"}]:
+            with self.subTest(generation=bad):
+                self._assert_invalid(lambda: run("t", "https://example.test", generation=bad))
+
     def test_no_run_starts_for_invalid_input(self):
         with self.assertRaises(JevValidationError):
             asyncio.run(run("t", "nope"))
@@ -275,6 +328,37 @@ class SuccessPathTests(FakeRunnerTestCase):
         request = result["output"]["request"]
         self.assertEqual((request["max_steps"], request["timeout_ms"],
                           request["max_cost_usd"]), (25, 120000, 0.5))
+
+    def test_supplied_values_reach_the_request_unchanged(self):
+        values = {"email": "dana@example.test", "note": " keep  spacing. ", "blank": ""}
+        request = self.go(values=values)["output"]["request"]
+        self.assertEqual(request["values"], values)
+        self.assertEqual(request["values"]["note"], " keep  spacing. ")
+        self.assertEqual(request["generation"], "disabled")
+
+    def test_generation_defaults_and_overrides(self):
+        plain = self.go()["output"]["request"]
+        self.assertIsNone(plain["values"])
+        self.assertEqual(plain["generation"], "helper")
+        self.assertEqual(self.go(values={})["output"]["request"]["generation"], "helper")
+        bound = self.go(values={"a": "b"}, generation="helper")["output"]["request"]
+        self.assertEqual(bound["generation"], "helper")
+        self.assertEqual(self.go(generation="disabled")["output"]["request"]["generation"], "disabled")
+
+    def test_login_request_is_unchanged_by_the_binding_fields(self):
+        with self.mode("login_ok"):
+            request = asyncio.run(login())["output"]["request"]
+        self.assertNotIn("values", request)
+        self.assertNotIn("generation", request)
+
+    def test_actions_report_which_value_was_used(self):
+        result = self.go(values={"email": "dana@example.test"})
+        self.assertEqual(
+            [(a["value_key"], a["value_source"]) for a in result["actions"]],
+            [("email", "supplied"), (None, "skipped"), (None, None), (None, None)],
+        )
+        self.assertNotIn("text", result["actions"][0])
+        self.assertNotIn("dana@example.test", result["text"])
 
     def test_screenshot_is_an_existing_absolute_png(self):
         result = self.go()

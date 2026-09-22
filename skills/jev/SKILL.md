@@ -39,9 +39,9 @@ There is no silent model/provider fallback or automatic task replay.
 | Shadow DOM, iframe, canvas, upload, popup, or arbitrary keyboard interaction | Do not assume Jev supports it; choose a verified alternative or report Blocked |
 | Native iOS or Android app | Neither local Chrome executor establishes native-app coverage |
 
-Jev selects code-owned actions from the observed DOM. Its text helper supplies field
-values when needed. It does not accept an output schema and does not generate a
-free-form answer to an extraction question.
+Jev selects code-owned actions from the observed DOM. You can supply the exact field
+values; its text helper writes a value only when you allow it to. Jev does not accept an
+output schema and does not generate a free-form answer to an extraction question.
 
 ## Run one complete task
 
@@ -64,11 +64,11 @@ Do not put credentials in the task. Test on approved local or staging environmen
 Purchases, messages, deletion, or other consequential actions need explicit authority.
 A natural-language restriction is not a sandbox or a technical action allowlist.
 
-For exact form values, use quoted strings or a JSON object in the task, and state that
-punctuation must not change. Do not put credentials in that object. Independent readback
-is still required: a native validation attempt added a period to a free-text field while
-the executor reported completed. Another attempt stopped on an invalid helper value.
-Neither failure is automatically retried or treated as success.
+For exact form values, pass `values` (see the next section) instead of describing the
+strings in the task. Independent readback is still required: a native validation attempt
+added a period to a free-text field while the executor reported completed. Another
+attempt stopped on an invalid helper value. Neither failure is automatically retried or
+treated as success.
 
 A successful result has `status="completed"`, `output`, `text`, `steps`, `cost`,
 `usage`, `screenshot_path`, `artifact_dir`, `profile_dir`, model identifiers, warnings,
@@ -93,6 +93,64 @@ except jev.JevError as error:
 
 Do not repeat an uncertain submission. Inspect the state first. A switch to Astra is
 an explicit handoff, not an automatic restart of the original task.
+
+## Exact field values
+
+Pass the exact strings in `values`. Jev then binds one supplied value to each field it
+fills, instead of asking the text helper to invent the text.
+
+```python
+result = await jev.run(
+    "Open the feedback form, fill it from the supplied values, then submit it.",
+    url="https://your-approved-app.example/feedback",
+    profile="work",
+    values={
+        "reviewer_name": "Ada Lovelace",
+        "comment": "Clear guide. No changes needed.",
+        "referral_code": "",
+    },
+    generation="disabled",
+)
+for action in result["actions"]:
+    print(action["kind"], action["value_key"], action["value_source"])
+```
+
+`values` is a dict of up to 20 entries, or None. Keys match
+`^[A-Za-z][A-Za-z0-9_]{0,63}$`. Each value is a string of at most 2000 characters.
+A bad key, a non-string value, more than 20 entries or an over-long value raises
+`jev.JevValidationError` with status `invalid_input`, before the browser starts. An empty
+dict is treated as no values.
+
+The string is typed byte for byte. Jev does not strip spaces, change punctuation or
+normalise anything. An empty string is allowed and means clear the field.
+
+`generation` decides what happens when no supplied value belongs in a field:
+
+- `"helper"`: the text helper may write a value, as it always has.
+- `"disabled"`: the text helper is never called, and the field is skipped.
+- Default `None`: resolves to `"disabled"` when you pass `values`, and to `"helper"`
+  when you do not. Any other value raises `jev.JevValidationError`.
+
+A skipped field types nothing. Jev records the step, then observes the page and carries
+on. Three steps in a row with no page change still end the run as blocked, and three
+skips in a row do exactly that.
+
+Each entry in `result["actions"]` carries two more fields:
+
+- `value_key`: the supplied key that was used, or None.
+- `value_source`: `"supplied"`, `"helper"`, `"skipped"`, or None for actions that are
+  not fills.
+
+The typed text stays out of the result, as before.
+
+**Supplied values are visible to the decision model, in full, not just as a preview.**
+Jev sends each key and an 80-character preview of its value to the model that picks the
+next action, but that preview is not a privacy bound. Once a value is typed, the full
+string is visible to the decision model too, in the observed field value and the recent
+actions, and to the call that binds a value to a field, and to the text helper when
+`generation="helper"` runs. All of it leaves the host through OpenRouter and its selected
+providers. Never put a password, token, card number or any other credential or private
+data in `values`. Sign in with `jev.login` instead.
 
 ## Screenshots in the main session
 
@@ -133,15 +191,18 @@ sharing a name does not transfer authentication or in-progress actions.
 
 - Defaults: 25 actions, 120 seconds, soft model-cost limit $0.50. Upstream safety limits
   can stop a task sooner. The wrapper allows bounded artifact capture and cleanup time.
-- Cost includes Jev and the text helper. Limits are checked between calls/actions and
-  may overshoot by one request. Missing usage is unknown, never free; an unaccounted
-  successful provider call stops execution rather than continuing without a budget.
+- Cost includes Jev, the text helper and each value-binding call. Limits are checked
+  once per action and may overshoot by the requests of one action: a single fill action
+  can issue up to three requests, the decision call, the bind call and the helper call.
+  Missing usage is unknown, never free; an unaccounted successful provider call stops
+  execution rather than continuing without a budget.
 - `model` records the requested decision model; `resolved_model` records the returned
   version. The default requests `jev-latest`; the text helper is `inception/mercury-2.5`.
+  With `generation="disabled"` the text helper is never called.
 - Telemetry is disabled. Chrome and its browser-harness daemon are private to the run.
   They do not attach to the user's daily Chrome or load an unrelated workspace's dotenv.
-- Task data goes to OpenRouter and its selected model providers. Browser content can be
-  hostile. Use an isolated host for untrusted browsing.
+- Task data and supplied values go to OpenRouter and its selected model providers.
+  Browser content can be hostile. Use an isolated host for untrusted browsing.
 - Profiles, screenshots, transcripts and page text may contain private data. Known key
   redaction does not sanitize page screenshots. Do not publish raw artifacts by default.
 - Cancellation and timeouts stop owned processes before releasing the profile lock.
@@ -149,7 +210,7 @@ sharing a name does not transfer authentication or in-progress actions.
 
 ## Delegate a whole task
 
-Use one child per whole objective, not per click. After confirming model availability:
+Use one child per whole objective, not per click.
 
 ```python
 child = await rlm.spawn(
@@ -159,14 +220,18 @@ child = await rlm.spawn(
     "cost, and absolute screenshot path to the parent with agent_message.send. "
     "Report JevError with its actual status/message; do not retry uncertain actions.",
     name="jev-browser-task",
-    model="openai/gpt-6-astra",
     thinking="high",
 )
 ```
 
+The child model is your choice. Omit `model` to inherit yours, or pass a selector you
+have confirmed with `rlm.find_models`. An unavailable selector fails the spawn. The
+child Prime Agent model is separate from Jev's own decision model, which this argument
+does not change.
+
 Replace the task/URL placeholders with the approved objective before spawning. Spawn
 returns immediately. Let the child finish and send its reply; the parent loads the
-screenshot with `attach_image`. The child Prime Agent model is separate from Jev.
+screenshot with `attach_image`.
 
 ## Validation
 
@@ -175,5 +240,8 @@ That file records commands, evidence and any remaining gaps; it must not label p
 tests as passed. From a fresh Prime Agent session in another directory, verify native
 `jev` discovery, run an approved local task, check its independent outcome, and view its
 PNG. Also test typed provider failure, profile contention and login persistence.
+
+Exact-value binding has deterministic tests with mocked model responses only. No live
+run has exercised it. Read the saved value back yourself before you report success.
 
 Source pin, license and local changes: `SOURCES.md`. Maintenance contract: `SPEC.md`.

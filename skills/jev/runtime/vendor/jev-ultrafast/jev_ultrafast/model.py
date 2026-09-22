@@ -1,4 +1,5 @@
-"""TypeSafe makes choices; an optional small OpenAI-compatible model writes field values."""
+"""TypeSafe makes choices, including which supplied value fits a field;
+an optional small OpenAI-compatible model writes the field values nobody supplied."""
 
 import json
 import math
@@ -7,9 +8,10 @@ import time
 
 import httpx
 
-from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
+from .questions import BIND_VALUE, NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
+SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone"
 
 
 def post_json(url, key, body):
@@ -78,11 +80,17 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def choose(state, goal, history):
+def choose(state, goal, history, values=None):
     elements, targets, controls = action_space(state["actions"])
+    typed_text = (
+        "Enter or replace text in an editable field. A supplied value or, if allowed, a small LLM "
+        "will provide the text."
+        if values
+        else "Enter or replace text in an editable field. A small LLM will supply the value from the goal."
+    )
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
-        "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
+        "TYPE_TEXT": typed_text,
         "SELECT": "Select an observed dropdown value.",
     }
     operations = {key: labels[key] for key in targets}
@@ -104,19 +112,22 @@ def choose(state, goal, history):
             },
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
+    request_state = {
+        "page": {k: state[k] for k in ("url", "title", "text")},
+        "elements": elements,
+        "recent_actions": [{k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]],
+    }
+    if values:
+        # Previews bound this menu only. Once typed, the value is visible in the page
+        # state, in recent_actions[].text and in elements[].value.
+        request_state["supplied_values"] = {key: value[:80] for key, value in values.items()}
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
-        "state": {
-            "page": {k: state[k] for k in ("url", "title", "text")},
-            "elements": elements,
-            "recent_actions": [
-                {k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]
-            ],
-        },
+        "state": request_state,
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    result = post_json(SYSTEMONE_URL, os.environ["TYPESAFE_API_KEY"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
@@ -157,6 +168,46 @@ def field_context(goal, action, page, history):
     }
 
 
+def bind_value(goal, action, page, history, values):
+    """Choose which supplied value belongs in this field. One TypeSafe request.
+
+    Returns the supplied key, or None when no supplied value belongs here. The
+    executor copies values[key] byte for byte; this call never writes text.
+    """
+    criteria = {key: {"key": key, "preview": value[:80]} for key, value in values.items()}
+    criteria["NONE"] = "No supplied value belongs in this field."
+    body = {
+        "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
+        "state": {
+            "page": {"url": page["url"], "title": page["title"], "text": page["text"][:6000]},
+            "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
+        },
+        "questions": {
+            "value": {
+                "type": "choice",
+                "criteria": criteria,
+                "instructions": {
+                    "goal": goal,
+                    "field": {k: action.get(k) for k in ("label", "role", "value")},
+                    "rules": BIND_VALUE,
+                },
+            }
+        },
+    }
+    started = time.perf_counter()
+    result = post_json(SYSTEMONE_URL, os.environ["TYPESAFE_API_KEY"], body)
+    answer = validate_choice(result["answers"].get("value", {}), criteria)
+    return {
+        "key": None if answer["choice"] == "NONE" else answer["choice"],
+        "confidence": answer["confidence"],
+        "probabilities": answer["probabilities"],
+        "usage": result.get("usage", {}),
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "model": result.get("model"),
+        "request": body,
+    }
+
+
 def field_text(context):
     key = os.environ.get("TEXT_MODEL_API_KEY")
     if not key:
@@ -187,7 +238,11 @@ def field_text(context):
     try:
         output = json.loads(result["choices"][0]["message"]["content"])
         value = output["text"]
-        if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        if set(output) != {"text"}:
+            raise ValueError()
+        # {"text": null} is the documented answer for "no value available": nothing is typed,
+        # and the caller skips the field instead of failing the run.
+        if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 2000):
             raise ValueError()
     except (ValueError, KeyError, TypeError):
         raise ValueError("Text helper returned no valid field value; nothing typed.") from None

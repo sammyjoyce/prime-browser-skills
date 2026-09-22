@@ -2,13 +2,30 @@
 jev-ultrafast agent, through a separate Python 3.12 runtime project.
 
     result = await jev.run(task, url, profile="default", max_steps=25,
-                           timeout_ms=120_000, max_cost_usd=0.5)
+                           timeout_ms=120_000, max_cost_usd=0.5,
+                           values=None, generation=None)
     result = await jev.login(profile="default", url="https://example.com",
                              timeout_ms=600_000)
 
 jev executes browser actions. It does not extract typed answers (no schema
 argument) and it never verifies the goal: output["verification"] is always
 "not_performed" and an upstream DONE only sets output["completion_claimed"].
+
+Supplied values: values={"email": "dana@example.test"} binds exact strings to
+fields. A bound value is copied into the field byte for byte, with no trimming
+and no punctuation added, and "" clears the field. Every key, plus an 80-character
+preview of each value, is sent to the decision model in state.supplied_values.
+That preview is not a privacy bound: once a value is typed, the full value is
+visible to the decision model too, in state.elements[].value and
+state.recent_actions[].text. The bind_value() call also sends the field's
+current value and recent action text in full, and the text helper sees the same
+page text and recent actions when generation="helper". Never pass credentials or
+private data in values. generation="helper" lets the small text helper write a
+value for a field that no supplied value fits; generation="disabled" skips that
+field and types nothing. generation defaults to "disabled" when values is given
+and to "helper" otherwise. Each entry in result["actions"] reports value_key
+and value_source ("supplied", "helper", "skipped" or null); the text that was
+typed is never returned.
 
 Result dict, always with the same keys: status ("completed" on success),
 output, text, steps, cost (None means unknown, never a fake 0.0; a completed
@@ -115,8 +132,12 @@ _MAX_URL_CHARS = 2_048
 _MAX_STEPS = 500
 _MAX_TIMEOUT_MS = 86_400_000  # 24 hours
 _MAX_COST_USD = 100.0
+_MAX_VALUES = 20
+_MAX_VALUE_CHARS = 2_000
+_GENERATION = ("helper", "disabled")
 
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_VALUE_KEY_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 _SECRET_NAME_RE = re.compile(r"(API_KEY|TOKEN|SECRET|PASSWORD)", re.IGNORECASE)
 _REDACTED = "[REDACTED]"
 _STDOUT_SNIPPET_CHARS = 2000
@@ -242,6 +263,41 @@ def _validate_url(url: Any) -> str:
     except ValueError:
         _invalid(f"url has an invalid port, got {url!r}")
     return candidate
+
+
+def _validate_values(values: Any) -> dict | None:
+    """None, or an exact copy of the caller's field values.
+
+    Nothing is trimmed, reformatted or dropped, and "" is a real value meaning
+    clear that field. Error messages carry types and lengths, never the values.
+    """
+    if values is None:
+        return None
+    if not isinstance(values, dict):
+        _invalid(f"values must be a dict of strings or None, got {type(values).__name__}")
+    if len(values) > _MAX_VALUES:
+        _invalid(f"values must have at most {_MAX_VALUES} entries, got {len(values)}")
+    for key, value in values.items():
+        if not isinstance(key, str) or not _VALUE_KEY_RE.match(key):
+            _invalid("values keys must match [A-Za-z][A-Za-z0-9_]{0,63}, got " + repr(key))
+        if key == "NONE":
+            _invalid("values keys must not be 'NONE'; that name is reserved for the no-value choice")
+        if not isinstance(value, str):
+            _invalid(f"values[{key!r}] must be a string, got {type(value).__name__}")
+        if len(value) > _MAX_VALUE_CHARS:
+            _invalid(
+                f"values[{key!r}] must be at most {_MAX_VALUE_CHARS} characters, got {len(value)}"
+            )
+    return dict(values)
+
+
+def _validate_generation(generation: Any, values: dict | None) -> str:
+    """Supplied values turn the text helper off unless the caller asks for it."""
+    if generation is None:
+        return "disabled" if values else "helper"
+    if generation not in _GENERATION:
+        _invalid(f"generation must be 'helper', 'disabled' or None, got {generation!r}")
+    return generation
 
 
 def _validate_number(value: Any, name: str, maximum: float, whole: bool = False) -> float:
@@ -710,6 +766,8 @@ async def _invoke_runner(
     max_steps: int,
     timeout_ms: int,
     max_cost_usd: float,
+    values: dict | None = None,
+    generation: str | None = None,
 ) -> dict:
     home = _home_dir()
     profiles_root = home / "profiles"
@@ -753,6 +811,10 @@ async def _invoke_runner(
                 "timeout_ms": timeout_ms,
                 "max_cost_usd": max_cost_usd,
             }
+            if op == "run":
+                # login opens a window and types nothing, so its request is unchanged.
+                request["values"] = values
+                request["generation"] = generation
 
             fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             stderr_fh = os.fdopen(fd, "wb")
@@ -829,13 +891,26 @@ async def run(
     max_steps: int = 25,
     timeout_ms: float = 120_000,
     max_cost_usd: float = 0.5,
+    values: dict | None = None,
+    generation: str | None = None,
 ) -> dict:
     """Run one agentic browser task from url; see the module docstring.
 
-    max_cost_usd is a soft cap over the jev decision calls and the text helper
-    calls. status is "completed" only when the runner finished, a native PNG
-    exists and cleanup succeeded; every other status raises a typed JevError
-    carrying the partial result.
+    max_cost_usd is a soft cap over the jev decision calls, the value-binding
+    calls and the text helper calls. status is "completed" only when the runner
+    finished, a native PNG exists and cleanup succeeded; every other status
+    raises a typed JevError carrying the partial result.
+
+    values maps a key to the exact string to type, at most 20 entries of at most
+    2000 characters; "" clears the field. A bound value is typed byte for byte.
+    The keys and an 80-character preview of each value are visible to the
+    decision model in state.supplied_values, but that preview is not a privacy
+    bound: the full value is visible too, once typed, in state.elements[].value
+    and state.recent_actions[].text, and to the text helper when
+    generation="helper". Never pass credentials or private data in values.
+    generation is "helper" (the text helper may write a value no supplied value
+    fits), "disabled" (skip that field) or None, which means "disabled" when
+    values is given and "helper" otherwise.
     """
     task = _validate_task(task)
     url = _validate_url(url)
@@ -843,7 +918,11 @@ async def run(
     max_steps = _validate_number(max_steps, "max_steps", _MAX_STEPS, whole=True)
     timeout_ms = _validate_number(timeout_ms, "timeout_ms", _MAX_TIMEOUT_MS, whole=True)
     max_cost_usd = _validate_number(max_cost_usd, "max_cost_usd", _MAX_COST_USD)
-    return await _invoke_runner("run", task, url, profile, max_steps, timeout_ms, max_cost_usd)
+    values = _validate_values(values)
+    generation = _validate_generation(generation, values)
+    return await _invoke_runner(
+        "run", task, url, profile, max_steps, timeout_ms, max_cost_usd, values, generation
+    )
 
 
 async def login(

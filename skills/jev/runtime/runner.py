@@ -8,8 +8,11 @@ Operations
     run    - drive the vendored jev-ultrafast agent against an http(s) URL.
     login  - open a headed browser on a named profile so a person can sign in.
 
-The vendored upstream package in vendor/jev-ultrafast is never edited. Two
-runtime adaptations are applied in-process and are listed in DEVIATIONS.
+The package in vendor/jev-ultrafast is a maintained fork of upstream pin
+1231850a0bf1a0c0341fe408ef1668dbbfdfac46, not an untouched copy; every local
+change to it is listed in vendor/PROVENANCE.md. Four further adaptations are
+applied in-process. All five differences from upstream, the fork included, are
+listed in DEVIATIONS.
 """
 
 from __future__ import annotations
@@ -44,6 +47,10 @@ HELPER_MODEL = "inception/mercury-2.5"
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PROFILE_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+VALUE_KEY_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9_]{0,63}\Z")
+MAX_VALUES = 20
+MAX_VALUE_CHARS = 2000
+GENERATION = ("helper", "disabled")
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 
@@ -66,6 +73,11 @@ DEVIATIONS = [
     "ever reached later than these.",
     "browser: a dedicated Chrome with the named profile directory is launched by this runner and "
     "reached through browser-harness BU_CDP_URL. The user's running Chrome is never attached.",
+    "fork: vendor/jev-ultrafast is a maintained fork of the upstream pin, not an untouched copy. "
+    "Two behaviours differ from upstream: a caller-supplied value is bound to a field by one "
+    "TypeSafe choice and typed byte for byte, and a text helper that answers {\"text\": null} now "
+    "skips the field instead of ending the run. Every local change is listed in "
+    "vendor/PROVENANCE.md.",
 ]
 
 # Statuses. Only "completed" means DONE plus a native PNG plus successful cleanup.
@@ -228,6 +240,38 @@ def http_url(value, field):
     return value
 
 
+def supplied_values(value, field="values"):
+    """None, or a bounded dict of exact field values. Nothing is normalised here.
+
+    An empty string is a real value: it means clear that field.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RequestError(f"{field} must be an object or null, got {type(value).__name__}")
+    if len(value) > MAX_VALUES:
+        raise RequestError(f"{field} must have at most {MAX_VALUES} entries, got {len(value)}")
+    for key, item in value.items():
+        if not isinstance(key, str) or not VALUE_KEY_RE.match(key):
+            raise RequestError(f"{field} keys must match [A-Za-z][A-Za-z0-9_]{{0,63}}, got {key!r}")
+        if key == "NONE":
+            raise RequestError(f"{field} keys must not be 'NONE'; that name is reserved for the no-value choice")
+        if not isinstance(item, str):
+            raise RequestError(f"{field}[{key!r}] must be a string, got {type(item).__name__}")
+        if len(item) > MAX_VALUE_CHARS:
+            raise RequestError(f"{field}[{key!r}] must be at most {MAX_VALUE_CHARS} characters, got {len(item)}")
+    return dict(value)
+
+
+def generation_mode(value, values, field="generation"):
+    """Supplied values turn the text helper off unless the caller asks for it."""
+    if value is None:
+        return "disabled" if values else "helper"
+    if value not in GENERATION:
+        raise RequestError(f"{field} must be 'helper', 'disabled' or null, got {value!r}")
+    return value
+
+
 def normalize(request):
     op = request.get("op")
     if op not in {"run", "login"}:
@@ -251,10 +295,15 @@ def normalize(request):
         config["task"] = task.strip()
         config["max_steps"] = positive_int(request.get("max_steps", 25), "max_steps")
         config["max_cost_usd"] = positive_number(request.get("max_cost_usd", 0.5), "max_cost_usd")
+        # Re-validated here as well as in the wrapper: a runner never trusts its caller.
+        config["values"] = supplied_values(request.get("values"))
+        config["generation"] = generation_mode(request.get("generation"), config["values"])
     else:
         config["task"] = None
         config["max_steps"] = None
         config["max_cost_usd"] = None
+        config["values"] = None
+        config["generation"] = None
     return config
 
 
@@ -291,11 +340,11 @@ def normalized_finish_reason(value):
 def helper_response_shape(payload):
     """Metadata about a helper response. No values and no key names are kept.
 
-    Upstream accepts only exactly {"text": "<non-blank string>"} and rejects
-    everything else, including its own documented {"text": null} for a missing
-    value. These counts and booleans separate those cases without capturing any
-    field content: a model-chosen key could itself contain field data, so keys
-    are counted and compared, never recorded.
+    The vendored fork accepts exactly {"text": "<non-blank string>"}, plus the
+    documented {"text": null} for a missing value, which now skips the field
+    instead of ending the run. These counts and booleans separate the remaining
+    failure modes without capturing any field content: a model-chosen key could
+    itself contain field data, so keys are counted and compared, never recorded.
     """
     shape = dict.fromkeys(
         (
@@ -1155,7 +1204,11 @@ def run_operation(config, owned, result):
     start_private_daemon(owned, artifact_dir, os.environ["BU_NAME"])
     check_stop()
 
-    agent = Agent(config["url"], config["task"])
+    # Count only: a supplied value is never written to stderr, the result, or an artifact.
+    log(f"supplied_values={len(config['values'] or {})} generation={config['generation']}")
+    agent = Agent(
+        config["url"], config["task"], values=config["values"], generation=config["generation"]
+    )
     stop_reason = None
     error = None
     final_state = None
@@ -1216,11 +1269,19 @@ def run_operation(config, owned, result):
         f"jev finished with upstream status {(final_state or {}).get('status')!r} after {len(history)} action(s); "
         f"final url {page.get('url')}"
     )
-    result["actions"] = [
-        {k: h.get(k) for k in ("step", "kind", "action", "operation", "probability", "confidence", "page_changed")}
-        for h in history
-    ]
+    result["actions"] = action_rows(history)
     return stop_reason, error
+
+
+ACTION_FIELDS = (
+    "step", "kind", "action", "operation", "probability", "confidence", "page_changed",
+    "value_key", "value_source",
+)
+
+
+def action_rows(history):
+    """Reported actions. Which value was used, never the text that was typed."""
+    return [{k: h.get(k) for k in ACTION_FIELDS} for h in history]
 
 
 def safe_snapshot(agent):

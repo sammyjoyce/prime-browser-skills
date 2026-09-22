@@ -428,8 +428,180 @@ def test_helper_response_shape(runner):
     check("shape.unknown_finish_reason_masked", runner.normalized_finish_reason("weird-value-123") == "other")
 
 
+def test_supplied_values(runner):
+    """Exact values in, nothing normalised, and the default generation rule."""
+    base = {
+        "op": "run",
+        "task": "fill the form",
+        "url": "http://127.0.0.1:1/",
+        "profile_dir": "/tmp/jev-test-profile",
+        "artifact_dir": "/tmp/jev-test-artifacts",
+    }
+
+    def with_fields(**extra):
+        request = dict(base)
+        request.update(extra)
+        return lambda: runner.normalize(request)
+
+    def normalized(**extra):
+        request = dict(base)
+        request.update(extra)
+        return runner.normalize(request)
+
+    plain = normalized()
+    check("values.absent_is_none", plain["values"] is None)
+    check("values.absent_means_helper", plain["generation"] == "helper")
+    bound = normalized(values={"email": "dana@example.test", "note": ""})
+    check("values.accepts_object", bound["values"] == {"email": "dana@example.test", "note": ""})
+    check("values.empty_string_is_a_value", bound["values"]["note"] == "")
+    check("values.default_generation_is_disabled", bound["generation"] == "disabled")
+    check("values.explicit_helper_is_kept", normalized(values={"a": "b"}, generation="helper")["generation"] == "helper")
+    check("values.disabled_without_values", normalized(generation="disabled")["generation"] == "disabled")
+    check("values.empty_object_still_helper", normalized(values={})["generation"] == "helper")
+    exact = " Z\u00fcrich Hauptbahnhof. "
+    check("values.copied_byte_for_byte", normalized(values={"a": exact})["values"]["a"] == exact)
+    full = normalized(values={f"k{i}": "x" * runner.MAX_VALUE_CHARS for i in range(runner.MAX_VALUES)})
+    check("values.boundary_sizes_accepted", len(full["values"]) == 20 and len(full["values"]["k0"]) == 2000)
+    check("values.longest_key_accepted", normalized(values={"a" * 64: "x"})["values"]["a" * 64] == "x")
+    expect_raises("values.rejects_list", runner.RequestError, with_fields(values=["a"]), "object")
+    expect_raises("values.rejects_string", runner.RequestError, with_fields(values="email=x"), "object")
+    expect_raises("values.rejects_int_value", runner.RequestError, with_fields(values={"a": 5}), "string")
+    expect_raises("values.rejects_bool_value", runner.RequestError, with_fields(values={"a": True}), "string")
+    expect_raises("values.rejects_null_value", runner.RequestError, with_fields(values={"a": None}), "string")
+    expect_raises("values.rejects_leading_digit_key", runner.RequestError, with_fields(values={"1a": "x"}), "keys must")
+    expect_raises("values.rejects_empty_key", runner.RequestError, with_fields(values={"": "x"}), "keys must")
+    expect_raises("values.rejects_dashed_key", runner.RequestError, with_fields(values={"a-b": "x"}), "keys must")
+    expect_raises("values.rejects_long_key", runner.RequestError, with_fields(values={"a" * 65: "x"}), "keys must")
+    expect_raises("values.rejects_key_none", runner.RequestError, with_fields(values={"NONE": "x"}), "NONE")
+    expect_raises(
+        "values.rejects_too_many",
+        runner.RequestError,
+        with_fields(values={f"k{i}": "x" for i in range(runner.MAX_VALUES + 1)}),
+        "at most 20",
+    )
+    expect_raises(
+        "values.rejects_long_value",
+        runner.RequestError,
+        with_fields(values={"a": "x" * (runner.MAX_VALUE_CHARS + 1)}),
+        "at most 2000",
+    )
+    expect_raises("generation.rejects_unknown", runner.RequestError, with_fields(generation="auto"), "helper")
+    expect_raises("generation.rejects_number", runner.RequestError, with_fields(generation=1), "helper")
+    login = runner.normalize(
+        {
+            "op": "login",
+            "url": "https://example.com",
+            "profile_dir": "/tmp/p",
+            "artifact_dir": "/tmp/a",
+            "values": {"a": "b"},
+        }
+    )
+    check("values.login_binds_nothing", login["values"] is None and login["generation"] is None)
+
+
+def test_reported_actions_and_deviations(runner):
+    history = [
+        {
+            "step": 1, "kind": "fill", "action": "Email", "operation": "TYPE_TEXT", "probability": 0.9,
+            "confidence": 0.8, "page_changed": True, "text": "dana@example.test", "value_key": "email",
+            "value_source": "supplied", "note": None,
+        },
+        {
+            "step": 2, "kind": "click", "action": "Continue", "operation": "CLICK", "probability": 1.0,
+            "confidence": 1.0, "page_changed": True, "text": None, "value_key": None, "value_source": None,
+        },
+        {
+            "step": 3, "kind": "fill", "action": "Phone", "operation": "TYPE_TEXT", "probability": 1.0,
+            "confidence": 1.0, "page_changed": False, "text": None, "value_key": None,
+            "value_source": "skipped", "note": "no value bound to this field; nothing typed",
+        },
+    ]
+    rows = runner.action_rows(history)
+    check("actions.supplied_reported", rows[0]["value_key"] == "email" and rows[0]["value_source"] == "supplied")
+    check("actions.non_fill_is_null", rows[1]["value_key"] is None and rows[1]["value_source"] is None)
+    check("actions.skip_reported", rows[2]["value_source"] == "skipped" and rows[2]["value_key"] is None)
+    serialized = json.dumps(rows)
+    check("actions.typed_text_is_never_reported", "dana@example.test" not in serialized, serialized)
+    check("actions.note_is_not_reported", "nothing typed" not in serialized, serialized)
+    check("actions.old_history_entries_are_safe", runner.action_rows([{"step": 1}])[0]["value_source"] is None)
+    fork = [d for d in runner.DEVIATIONS if d.startswith("fork:")]
+    check("deviations.one_fork_entry", len(fork) == 1, str(len(fork)))
+    check("deviations.fork_names_binding", "byte for byte" in fork[0], fork[0] if fork else "")
+    check("deviations.fork_names_null_helper", "skips the field" in fork[0], fork[0] if fork else "")
+    check("deviations.fork_points_at_provenance", "vendor/PROVENANCE.md" in fork[0])
+    check("deviations.count_is_five", len(runner.DEVIATIONS) == 5, str(len(runner.DEVIATIONS)))
+    check("deviations.docstring_counts_them", "five differences" in runner.__doc__)
+    check("deviations.docstring_drops_never_edited", "never edited" not in runner.__doc__)
+
+
+def test_bind_call_is_costed_like_a_decision(runner):
+    """The binding request goes through the patched post_json and is accounted."""
+    import jev_ultrafast.model as jev_model
+
+    key = "sk-or-v1-" + "c" * 32
+    os.environ["TYPESAFE_API_KEY"] = key
+    os.environ["TYPESAFE_MODEL"] = "jev-test"
+    runner.register_secrets()
+    runner.install_provider_patch()
+
+    class Response:
+        status_code = 200
+        is_error = False
+        text = ""
+
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return json.loads(self._body)
+
+    body = json.dumps(
+        {
+            "model": "typesafe/jev-test-2026",
+            "answers": {
+                "value": {"choice": "email", "confidence": 0.91, "probabilities": {"email": 0.91, "NONE": 0.09}}
+            },
+            "usage": {"cost": 0.0004, "total_tokens": 120},
+        }
+    )
+    sent = []
+
+    class Inner:
+        def post(self, url, **kwargs):
+            sent.append((url, kwargs.get("json")))
+            return Response(body)
+
+    runner.HTTP_ATTEMPTS.clear()
+    runner.LOGICAL_CALLS.clear()
+    jev_model.CLIENT = runner.RecordingClient(Inner())
+    page = {"url": "https://example.test/form", "title": "Sign in", "text": "Email address"}
+    action = {"kind": "fill", "label": "Email", "role": "textbox", "value": "", "node": 3}
+    long_value = "dana@example.test " + "x" * 200
+    answer = jev_model.bind_value("Sign in as Dana", action, page, [], {"email": long_value})
+    check("bind.returns_the_supplied_key", answer["key"] == "email", str(answer["key"]))
+    check("bind.one_http_attempt", len(runner.HTTP_ATTEMPTS) == 1, str(len(runner.HTTP_ATTEMPTS)))
+    check("bind.role_is_decision", runner.HTTP_ATTEMPTS[0]["role"] == "decision", str(runner.HTTP_ATTEMPTS[0]["role"]))
+    check("bind.url_is_the_runtime_endpoint", sent[0][0] == runner.SYSTEMONE_URL, str(sent[0][0]))
+    preview = sent[0][1]["questions"]["value"]["criteria"]["email"]["preview"]
+    check("bind.preview_is_bounded", preview == long_value[:80], preview)
+    check("bind.none_is_offered", "NONE" in sent[0][1]["questions"]["value"]["criteria"])
+    cost, detail = runner.cost_summary()
+    check("bind.cost_is_counted", cost is not None and abs(cost - 0.0004) < 1e-12, str(cost))
+    summary = runner.usage_summary()
+    check("bind.usage_is_decision_role", summary["decision"]["http_attempts"] == 1, json.dumps(summary))
+    check("bind.usage_counts_tokens", summary["decision"]["total_tokens"] == 120, json.dumps(summary))
+    check("bind.resolved_model_seen", runner.resolved_model_for("decision") == "typesafe/jev-test-2026")
+    check("bind.no_helper_attempt", not [a for a in runner.HTTP_ATTEMPTS if a["role"] == "helper"])
+    runner.HTTP_ATTEMPTS.clear()
+    runner.LOGICAL_CALLS.clear()
+    os.environ.pop("TYPESAFE_MODEL", None)
+
+
 UNIT_TESTS = [
     test_group_scan_excludes_itself,
+    test_supplied_values,
+    test_reported_actions_and_deviations,
+    test_bind_call_is_costed_like_a_decision,
     test_helper_response_shape,
     test_validation,
     test_cost_rules,
