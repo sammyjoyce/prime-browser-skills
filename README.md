@@ -107,6 +107,7 @@ A Jev result nests its completion fields under `output`:
 result["output"]["verification"]        # always "not_performed"
 result["output"]["completion_claimed"]  # True when Jev chose DONE
 result["output"]["final_url"]           # with final_title and page_text
+result["verification"]                  # scoped DOM checks, "not_run" by default
 ```
 
 `jev.run` also takes `values` and `generation` for exact form values:
@@ -123,6 +124,29 @@ Values are typed byte for byte, and an empty string clears the field. `generatio
 none is bound, and it defaults to `"disabled"` when you pass `values` and to `"helper"`
 when you do not. The typed text never appears in the result. `skills/jev/SKILL.md` holds
 the full rules.
+
+`jev.run` also takes `checks`, a list of read-only DOM assertions about the page the
+browser ends on:
+
+```python
+result = await jev.run(task, url=start_url, profile="work", checks=[
+    {"id": "landed", "kind": "url", "contains": "/thanks"},
+    {"id": "banner", "kind": "text", "selector": "#status", "equals": "Thank you"},
+    {"id": "errors", "kind": "count", "selector": ".field-error", "equals": 0},
+])
+result["verification"]["status"]     # passed, failed, unknown or not_run
+result["verification"]["checks"][0]  # id, status, reason, observed evidence, fingerprint
+```
+
+The kinds are `url`, `title`, `text`, `value` and `count`, with `equals` or `contains`.
+They run once after execution, read only, with no model call and no arbitrary
+JavaScript. `result["verification"]["scope"]` is always `declared_dom_checks_only`, and
+this is a different field from `result["output"]["verification"]`, which stays
+`"not_performed"`. Only an observed mismatch is `failed`; missing, ambiguous or refused
+evidence is `unknown`. A failed check does not change the run status, and passing DOM
+evidence is not proof that a server stored anything. Your declaration is not echoed
+back: each row carries the SHA-256 `fingerprint` of the check it answers, and a result
+whose ordered fingerprints are not the declared ones raises `jev.JevProtocolError`.
 
 A completed status means the executor claimed the task was done, the screenshot was
 saved, and cleanup succeeded. It is not independent proof. Check the real postcondition,
@@ -148,7 +172,8 @@ Chrome user-data directory.
 
 - Jev chooses code-owned actions from the observed DOM. It takes no output schema and
   writes no free-form answer. Use `browser_use` with Astra for typed extraction and
-  open-ended reasoning.
+  open-ended reasoning. `checks` returns evidence for assertions you declare yourself;
+  it is not an extraction API, and it reads only the current page's DOM.
 - Shadow DOM, iframes, canvas, upload, popups, and arbitrary keyboard input are not
   established capabilities. Verify or report the task as blocked.
 - Jev's text helper writes free-text values. It can change a value, for example by
@@ -172,8 +197,8 @@ Chrome user-data directory.
 
 ## Validation status
 
-Each runtime skill ships deterministic tests that use fake runners, so they need no key,
-no Chrome, and no paid call:
+Each runtime skill ships deterministic tests. The commands below need no key and no paid
+call, and only the optional Jev groups need Chrome:
 
 Run each command from the repository root. None of them changes the working
 directory:
@@ -189,8 +214,13 @@ python3 -m unittest discover -s tests -v
 ```
 
 The last command tests `install.py` and needs no browser and no dependency install.
-The Jev runtime suite also takes `--group browser` and `--group login`. Those two groups
-start a real Chrome. They still make no model call.
+The Jev runtime suite also takes `--group checks`, `--group browser` and
+`--group login`. All three start a real Chrome and still make no model call; only
+`checks` is headless, and it exercises the declared DOM checks against a local fixture:
+
+```sh
+uv run --project skills/jev/runtime --frozen python skills/jev/runtime/tests/run_tests.py --group checks
+```
 
 `uv` and `npm` create `.venv` and `node_modules` inside the skill directories. Both are
 ignored by git.
@@ -198,16 +228,23 @@ ignored by git.
 On 2026-09-21, run from this public checkout with provider credentials removed, these
 suites reported 98 Jev runtime checks, 50 Jev wrapper tests, 33 browser-use Node tests,
 35 browser-use Python tests, and 9 installer tests, with no failures. The Jev suites
-have grown since, with exact-value binding; the current counts are 148 Jev runtime unit
-checks, 60 Jev wrapper tests, and 52 Jev vendor tests. All of these checks use fake
-runners or offline runtime paths and make no model call. They do not establish live task
-success.
+have grown since, with exact-value binding and declared DOM checks; the counts measured
+on 2026-09-22 are 273 Jev runtime unit checks, 49 Jev runtime `checks`-group checks
+against real headless Chrome, 75 Jev wrapper tests, 52 Jev vendor tests, and 10
+installer tests. After the protocol-consistency follow-up on that layer, the remeasured
+counts are 288 Jev runtime unit checks, 51 `checks`-group checks, and 94 Jev wrapper
+tests; vendor and installer trees were not edited. None of them makes a model call.
+All except the `checks` group use fake runners or offline runtime paths; the `checks`
+group drives real headless Chrome against a loopback fixture. None of them establishes
+live task success.
 
 Live validation of the native `jev` package is still in progress. A live navigation task
 passed. A live form task has failed in two different ways, and both failures are kept on
 record. Exact-value binding has deterministic tests with mocked model responses only and
-no live run at all. Do not read these deterministic results, or the benchmark below, as
-proof that form tasks are validated. `skills/jev/VALIDATION.md` holds the live record
+no live run at all. Declared DOM checks do have real headless-browser evidence, because
+they need a page and not a model, but no live model run has used them yet. Do not read
+these deterministic results, or the benchmark below, as proof that form tasks are
+validated. `skills/jev/VALIDATION.md` holds the live record
 and is not allowed to mark a planned check as passed.
 
 ## Benchmark summary

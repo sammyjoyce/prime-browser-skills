@@ -10,8 +10,8 @@ Operations
 
 The package in vendor/jev-ultrafast is a maintained fork of upstream pin
 1231850a0bf1a0c0341fe408ef1668dbbfdfac46, not an untouched copy; every local
-change to it is listed in vendor/PROVENANCE.md. Four further adaptations are
-applied in-process. All five differences from upstream, the fork included, are
+change to it is listed in vendor/PROVENANCE.md. Five further adaptations are
+applied in-process. All six differences from upstream, the fork included, are
 listed in DEVIATIONS.
 """
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import importlib.util
 import json
 import math
 import os
@@ -37,6 +38,25 @@ import uuid
 from pathlib import Path
 
 PROC_T0 = time.perf_counter()
+
+# The declared-check contract lives beside the wrapper, in the skill package,
+# and is loaded here from that one file. The wrapper validates a caller's
+# checks before this process exists; this runner validates the same request
+# again, with the same code, so the two boundaries cannot drift apart.
+# install.py copies src/ and runtime/ together, so both are always present.
+CHECKS_MODULE_PATH = Path(__file__).resolve().parent.parent / "src" / "jev" / "checks.py"
+
+
+def load_checks_module(path=CHECKS_MODULE_PATH):
+    spec = importlib.util.spec_from_file_location("jev_declared_checks", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"the declared-check contract could not be loaded from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+dom_checks = load_checks_module()
 
 UPSTREAM_COMMIT = "1231850a0bf1a0c0341fe408ef1668dbbfdfac46"
 UPSTREAM_SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone"
@@ -73,6 +93,10 @@ DEVIATIONS = [
     "ever reached later than these.",
     "browser: a dedicated Chrome with the named profile directory is launched by this runner and "
     "reached through browser-harness BU_CDP_URL. The user's running Chrome is never attached.",
+    "verification: when the caller declares DOM checks, this runner performs one extra read-only "
+    "JavaScript read through the upstream Browser.evaluate after the agent generator is closed, "
+    "and reports it as result['verification'] with scope 'declared_dom_checks_only'. The page is "
+    "never written to, the agent loop never sees it, and no check changes the run's status.",
     "fork: vendor/jev-ultrafast is a maintained fork of the upstream pin, not an untouched copy. "
     "Two behaviours differ from upstream: a caller-supplied value is bound to a field by one "
     "TypeSafe choice and typed byte for byte, and a text helper that answers {\"text\": null} now "
@@ -272,6 +296,18 @@ def generation_mode(value, values, field="generation"):
     return value
 
 
+def declared_dom_checks(value):
+    """The caller's read-only DOM checks, normalized, or [].
+
+    The same contract module the wrapper uses. Re-validated here as well as in
+    the wrapper: a runner never trusts its caller.
+    """
+    try:
+        return dom_checks.normalize_checks(value)
+    except dom_checks.CheckError as exc:
+        raise RequestError(str(exc)) from None
+
+
 def normalize(request):
     op = request.get("op")
     if op not in {"run", "login"}:
@@ -298,12 +334,15 @@ def normalize(request):
         # Re-validated here as well as in the wrapper: a runner never trusts its caller.
         config["values"] = supplied_values(request.get("values"))
         config["generation"] = generation_mode(request.get("generation"), config["values"])
+        config["checks"] = declared_dom_checks(request.get("checks"))
     else:
         config["task"] = None
         config["max_steps"] = None
         config["max_cost_usd"] = None
         config["values"] = None
         config["generation"] = None
+        # login opens a window for a person; it asserts nothing about a page.
+        config["checks"] = []
     return config
 
 
@@ -1118,6 +1157,9 @@ def base_result(config):
         "duration_ms": None,
         "warnings": [],
         "error": None,
+        # Declared DOM checks, filled in by run_operation or finalize. Never
+        # the same field as output["verification"], which stays "not_performed".
+        "verification": None,
         "upstream_commit": UPSTREAM_COMMIT,
         "deviations": list(DEVIATIONS),
     }
@@ -1125,6 +1167,12 @@ def base_result(config):
 
 def finalize(result, config):
     if config["op"] == "run":
+        # A run that ended before the checks could run still reports them, as
+        # unknown rows: silence would read like "nothing was declared".
+        if not isinstance(result.get("verification"), dict):
+            result["verification"] = dom_checks.verification_payload(
+                config.get("checks") or [], reason="verification_not_attempted"
+            )
         result["usage"] = usage_summary()
         cost, detail = cost_summary()
         result["cost"] = cost
@@ -1181,6 +1229,47 @@ def classify(exc):
     if name == "StalePage":
         return BROWSER_ERROR
     return BROWSER_ERROR
+
+
+# --------------------------------------------------------------------------
+# declared DOM checks: read-only evidence, inside the caller's declared scope
+# --------------------------------------------------------------------------
+def verify_declared_checks(browser, checks):
+    """Read the page once for the caller's declared checks. Never writes.
+
+    One synchronous JavaScript read returns observed values; every comparison
+    happens here. The expectation itself is never sent into the page. A read
+    that cannot run at all reports every declared check unknown, never failed,
+    and never raises: verification is evidence, so it must not be able to
+    replace the run's own outcome or its artifacts.
+
+    The exception type is logged, never its message: a CDP error can quote the
+    expression, and nothing about a declared check belongs in a log.
+    """
+    if not checks:
+        return dom_checks.verification_payload([])
+    try:
+        payload = browser.evaluate(dom_checks.read_expression(checks))
+    except Exception as exc:
+        log(f"declared DOM checks could not be read: {type(exc).__name__}")
+        return dom_checks.verification_payload(
+            checks, reason="page_unavailable", redact=redact
+        )
+    return dom_checks.verification_payload(checks, payload=payload, redact=redact)
+
+
+def note_verification(result):
+    """A warning when a declared check did not pass. The status is unchanged."""
+    payload = result.get("verification")
+    if not isinstance(payload, dict) or payload.get("status") in (None, "passed", "not_run"):
+        return
+    counts = payload.get("counts") or {}
+    result["warnings"].append(
+        "declared DOM checks did not all pass: "
+        f"{counts.get('passed', 0)} passed, {counts.get('failed', 0)} failed, "
+        f"{counts.get('unknown', 0)} unknown; a completed status is still only an "
+        "executor claim"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1242,6 +1331,27 @@ def run_operation(config, owned, result):
 
     if final_state is None:
         final_state = safe_snapshot(agent)
+
+    # Declared DOM checks run here: after execution, before teardown, and
+    # before the screenshot, so a capture failure cannot destroy evidence that
+    # was already readable. They run after a partial stop too (blocked,
+    # max_steps, cost limit, timeout, cancellation), because a stopped run is
+    # exactly when a caller needs to know what the page actually shows. They
+    # are read-only, so running them after a failure changes nothing.
+    if config["checks"]:
+        try:
+            if owned.chrome is not None and owned.chrome.poll() is None:
+                result["verification"] = verify_declared_checks(agent.browser, config["checks"])
+            else:
+                result["verification"] = dom_checks.verification_payload(
+                    config["checks"], reason="browser_unavailable"
+                )
+        except Exception as exc:  # evidence never breaks the run or its artifacts
+            log(f"declared DOM checks failed to run: {type(exc).__name__}")
+            result["verification"] = dom_checks.verification_payload(
+                config["checks"], reason="page_unavailable"
+            )
+        note_verification(result)
 
     # Native PNG while the browser is still alive. Best effort after a failure,
     # and it can never overwrite the primary failure.

@@ -27,6 +27,31 @@ Python 3.12 while Prime Agent kernels may use 3.11. Do not install upstream into
   must keep saying that credentials never belong in `values`.
 - `result["actions"]` carries `value_key` and `value_source` for every action. The
   typed text itself stays out of the result.
+- Declared DOM checks are scoped evidence, never a verdict. `result["verification"]`
+  keeps `scope="declared_dom_checks_only"` and per-row `boundary="browser_dom"`, and it
+  is a different field from `output["verification"]`, which stays `"not_performed"`.
+  A failed or unknown check never changes the run status, and a passing check never
+  claims backend persistence or goal verification. The wrapper correlates returned
+  rows with the normalized declarations on completed and non-completed results alike,
+  and pins `note` and `consistency` to the contract's own values.
+- A row names its declaration with `fingerprint`, the SHA-256 of the normalized check,
+  computed at both boundaries before anything is serialized. The declaration itself is
+  never echoed back, so there is one source of truth and the runner's single redaction
+  pass over its whole result cannot turn an honest run into a protocol error. Identity
+  is the fingerprint, not the row `id`, which redaction may legitimately rewrite. The
+  fingerprint detects a mismatched declaration; it is not a signature and claims
+  nothing about a runner that lies.
+- Only an observed mismatch is `failed`. Missing, ambiguous, invisible, refused or
+  unreadable evidence is `unknown`; no declared check is `not_run`.
+- Checks are read-only and run once, after execution and before teardown, including
+  after a partial stop while the browser is alive. They never click, type, navigate or
+  execute caller-supplied JavaScript, and only the kind and selector reach the page.
+- Password, `type=hidden` and file inputs are refused and never return a value. There
+  is no attribute kind and no generic hidden-field extraction.
+- One contract file, `src/jev/checks.py`, validates checks in the wrapper before launch
+  and again inside the runner, which loads that same file by path. Neither boundary may
+  keep its own copy of the rules, and install.py must keep shipping `src/` and
+  `runtime/` together.
 
 ## Trigger cases
 
@@ -34,6 +59,9 @@ Should trigger: navigate through a known site; fill an approved test form; fill 
 with caller-supplied exact values; clear a field; complete a specified booking in
 staging; run a bounded browser interaction with screenshot return; use a persistent Jev
 login profile; delegate a whole action-heavy browser task.
+
+Should also trigger: assert a final URL, a visible status text, a field value or an
+element count on the end page through `checks`.
 
 Should not trigger: typed HN title extraction without actions; explain arbitrary source
 code; native iOS/Android testing; filesystem editing; requests for visual acceptance with
@@ -57,6 +85,23 @@ helper answer that skips instead of erroring; three skips in a row ending as blo
 a StalePage retry that does not bind twice; the binding call costed through `post_json`;
 and rejection of a bad key, a non-string value, more than 20 entries or a value over
 2000 characters.
+
+Declared DOM checks add their own cases: every kind against a real page; a mismatch
+reported failed; an ambiguous, missing, invisible, password, hidden, file or non-field
+selector reported unknown; an invalid selector reported unknown; a torn-down page
+reported unknown for every row; mixed outcomes summarised as failed; no declared check
+summarised as not_run; a failed check leaving the run status unchanged; identical
+validation and identical messages in the wrapper and in the runner, including unknown
+keys, duplicate ids, bool-as-count and non-finite numbers; the observed password and
+hidden-field values never returned; and evidence surviving into `result.json` and
+through the wrapper.
+
+Correspondence adds its own: a credential-shaped declaration keeping the run's real
+outcome through a real runner process and through the exact bytes `emit()` writes; a
+passing, failed and unknown result accepted after that redaction pass; and a changed
+selector, expectation, id, kind or row order, a missing or malformed fingerprint, a
+widened row boundary and a forged note or consistency each rejected as a protocol
+error.
 
 Do not claim every case passed unless VALIDATION.md points to its evidence. Changes to
 the runtime, the provider, the source pin or the vendor fork require both deterministic

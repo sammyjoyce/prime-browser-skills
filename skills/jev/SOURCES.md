@@ -29,6 +29,45 @@
 - OpenRouter System One protocol:
   https://openrouter.ai/docs/guides/community/typesafe-sdk
 
+## Declared DOM checks: adapted from a sibling branch
+
+`src/jev/checks.py` is adapted from work on this repository's own
+`codex/jev-first-browser-qa` branch, commit `91c6846fc46576b7665aac9aeb65eb242139380e`
+(`git show 91c6846:skills/jev/runtime/jev_runtime/evidence.py` and
+`.../contracts.py`). It is first-party code from the same project, not third-party
+material, so it needs no separate license entry. Taken from there: the shape of one
+batched, read-only DOM read (`evidence.READ`), the pass/fail/unknown summary rule
+(`evidence.summarize`), the refusal to read a password input or an ambiguous selector,
+and the `{id, kind, selector, equals|contains}` check schema with its bounded,
+unknown-keys-rejected validation (`contracts.checks`).
+
+Changed here, deliberately:
+
+- The expectation never reaches the page. Only the kind and the selector are sent;
+  every comparison happens in the runner's process. The source sent the whole check
+  object, expectation included, into the document.
+- One contract file validates both boundaries: the wrapper before it launches anything,
+  and the runner on the request it receives. The source validated only inside the
+  runtime, after the caller's process had already committed to a subprocess.
+- `attribute` checks are not supported. An absent attribute reads as `null`, which the
+  source reported as `failed`; that conflates "missing" with "wrong". Hidden and file
+  inputs are refused as well as password inputs, so there is no generic hidden-field
+  extraction.
+- A wrong evidence type, an unreadable page and an unusable row are `unknown` with a
+  fixed reason vocabulary, never `failed`.
+- The payload records `checked_at_url`, `checked_at_title`, `captured_at_ms`,
+  `declared`, `counts` and `consistency`, so a reader can see which document was read
+  and when.
+- Observed strings are redacted for known secret environment values and truncated at
+  2000 characters after comparison, so evidence cannot smuggle a secret into
+  `result.json`.
+- `id` defaults to `check[<index>]`, and the normalized snapshot is itself valid input,
+  so the wrapper can send exactly what it validated.
+- Not adopted: the `Engine` loop, the provider adapters, `allow`/`origins`, milestones,
+  extractions, collectors, the confidence thresholds, and the new status strings
+  (`needs_review`, `policy_blocked`, `verification_failed`). Declared checks never
+  change a run's status.
+
 ## Local evidence
 
 The initial comparison ran against the unmodified pinned commit, before the fork. It

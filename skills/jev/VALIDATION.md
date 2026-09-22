@@ -3,9 +3,11 @@
 Validation date: 2026-09-21. Host: macOS with installed Chrome. Wrapper runtime tested
 on Python 3.11 and 3.13; the separate browser runtime uses Python 3.12.13.
 
-Exact-value binding landed later, on 2026-09-22. Every count below is from the
-2026-09-21 run against the pre-fork tree. The suites have grown since. See
-"Exact-value binding (not live-validated)" for what that change has and has not proven.
+Exact-value binding landed later, on 2026-09-22. Every count in the next table is from
+the 2026-09-21 run against the pre-fork tree. The suites have grown since. See
+"Exact-value binding (not live-validated)" for what that change has and has not proven,
+and "Declared DOM checks" for the later `checks` argument, which does have real
+headless-browser evidence.
 
 ## Package and lifecycle checks
 
@@ -108,6 +110,141 @@ The two earlier form failures stay in the record above. A free-text value that g
 trailing period, and a protocol_error on an invalid helper value, are the reason this
 change exists. Neither is marked fixed. Deterministic tests do not retire them.
 
+## Declared DOM checks (deterministic, including real headless Chrome)
+
+Date: 2026-09-22, remeasured after the row-fingerprint follow-up. Scope: the
+`checks` argument on `jev.run`, the shared contract file `src/jev/checks.py`,
+`runner.verify_declared_checks`, and the new `result["verification"]` object. This did
+not change the agent loop, the vendored fork, the provider path, the lifecycle or any
+existing argument. The 2026-09-22 landing measured 75 wrapper tests and 273 unit
+checks; the follow-up that correlates returned rows with declarations, validates
+non-completed verification objects, and records URL/title truncation remeasured 86
+wrapper tests and 281 unit checks. The row-fingerprint follow-up, which stopped the
+correspondence gate from comparing the runner's redacted echo of the declaration,
+measures 94 wrapper tests, 288 unit checks and 51 `checks`-group checks. Historical
+2026-09-21 package counts stay in the table above.
+
+Unlike exact-value binding, this change has live browser evidence, because a declared
+check is deterministic: it needs a page, not a model. The `checks` group starts its own
+headless Chrome with its own profile and its own browser-harness daemon, serves a local
+fixture page, and runs the same `verify_declared_checks` the runner calls. It makes no
+model request and needs no API key.
+
+| Check | Result |
+|---|---|
+| Wrapper suite, `tests/` (89 methods in `test_jev.py` plus 5 real-runtime cases) | 94 tests passed |
+| Runtime unit group | 288 checks passed |
+| Runtime `checks` group, real headless Chrome and one real runner process | 51 checks passed |
+| Vendor fork tests, `tests/test_agent.py` (unchanged by this follow-up) | 52 tests passed (2026-09-22; vendor tree not edited) |
+| Installer tests, repository `tests/` | 10 tests passed (2026-09-22; installer not edited) |
+
+Commands, exit code 0 for each, run on 2026-09-22 from this checkout:
+
+```sh
+cd skills/jev
+uv run python -m unittest discover -s tests -v
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group unit
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+cd runtime/vendor/jev-ultrafast && uv run pytest -q
+cd ../../../../.. && python3 -m unittest discover -s tests -v
+```
+
+Lint, with the vendor's own ruff and its 120-character line length, over every file this
+change touched:
+
+```sh
+cd skills/jev/runtime/vendor/jev-ultrafast
+uv run ruff check --isolated --line-length 120 --select E,F,I   ../../../src/jev/checks.py ../../../src/jev/__init__.py ../../../runtime/runner.py   ../../../runtime/tests/run_tests.py ../../../runtime/tests/fixture_server.py   ../../../tests/test_jev.py ../../../tests/fake_runner.py   ../../../tests/test_runtime_launch.py
+```
+
+That command lists eight files. It reports 24 findings and exits 1, all of them in
+`runtime/runner.py` and `runtime/tests/run_tests.py`: 16 pre-existing long lines, 6
+deliberate mid-file imports (E402) and the 2 unsorted import blocks those cause. Run
+over the same eight files taken from the previous commit on this branch, it reports the
+same 24, in the same files under the same rules, so this change adds no new finding and
+cleans up none of the old ones. `src/jev/checks.py`, `src/jev/__init__.py` and the
+three test modules report nothing.
+
+An earlier revision of this section said 25. That count included one unused import in
+the repository's own `tests/test_install.py`, which the command above does not lint;
+that file still reports its single F401.
+
+The `checks` group runs two tests. The first starts the real runner process with
+declared checks and no `OPENROUTER_API_KEY`: the run stops before Chrome starts, and the
+result plus `result.json` report both declared checks as `unknown` with reason
+`verification_not_attempted`, never as passed and never dropped. A second request in the
+same test carries an unsupported check kind and comes back `invalid_request` from the
+runner itself, which is the re-validation the wrapper does not get to skip.
+
+The second test is the browser one. What it proved, on the local fixture at
+`runtime/tests/fixture_server.py`:
+
+- Every kind against a real page: exact and substring `url` and `title`, `text` on a
+  visible element, `value` on an input, a textarea, a select and a contenteditable
+  element, and `count` on 0, 2 and 3 matches.
+- A mismatch is `failed` for each kind that can fail.
+- Unknown, never failed, for: a selector matching two elements, a selector matching
+  none, a `display:none` element, a password input (both `value` and `text`), a
+  `type=hidden` input, a file input, an element that holds no value, and two invalid
+  selectors.
+- The password and hidden-field values in the fixture never appear in any observed
+  evidence. They appear in the result only where the test itself declared them as
+  expectations, which is the caller's own input.
+- The read changes nothing: a document-level capture listener for click, input, change,
+  submit, keydown and pointerdown counted zero events, and the field value and element
+  count were unchanged afterwards.
+- One read per call: every row carries the same `captured_at_ms`, and
+  `checked_at_url`/`checked_at_title` describe the document that was read.
+- After a navigation, a second call reports the new URL and different outcomes, which is
+  why the checks are documented as an end-state snapshot rather than a per-action
+  assertion.
+- After the page was closed, every row is `unknown` and nothing raised.
+
+Mocked and unmocked contract evidence in the unit group and the wrapper suite:
+
+- Both boundaries reject the same 29 invalid shapes (the `invalid` list in
+  `test_declared_check_contract`, asserted against `normalize_checks` and against
+  `runner.normalize`). The wrapper-only list in
+  `test_checks_must_follow_the_declared_schema` is 30 shapes; it is not the same set.
+  The runtime launch test runs the real runtime interpreter to confirm it loaded the
+  wrapper's own `checks.py` and produced byte-identical normalized output and identical
+  rejection messages.
+- A failed or unknown check leaves the run status `completed`, leaves
+  `output["verification"]` at `"not_performed"`, and only adds a warning.
+- A result whose verification is missing, short, mis-scoped, mis-bounded, invalid,
+  `not_run` with declared checks, present with no declared check, carrying a forged
+  `note` or `consistency`, whose rows do not fingerprint the ordered declarations or
+  disagree with them on kind or row boundary, whose `declared` count is not the integer
+  length, or whose counts/aggregate disagree with the rows is a protocol error in the
+  wrapper. The same correspondence check runs on completed results and on non-completed
+  results (`max_steps`, `blocked`, missing screenshot). The 14 single-row twists and
+  the 2 two-row twists in `fake_runner.twist_verification` are each asserted twice:
+  through the fake runner subprocess and directly against `_finish_result`.
+- A row names its declaration with a SHA-256 fingerprint computed before transport, so
+  the runner's single redaction pass over its whole result cannot break the match. Two
+  tests prove it with real code rather than a stand-in. A real runner process with no
+  `OPENROUTER_API_KEY` returns `credentials_error` for `contains="Saved"` and for the
+  synthetic placeholders `Bearer YOUR_TOKEN_HERE` and
+  `sk-EXAMPLE_PLACEHOLDER_00000000` alike, never a protocol error. The runtime
+  interpreter also builds a passing, a failed and an unknown payload with its own
+  contract and writes exactly the bytes `emit()` would write, redaction included; the
+  wrapper parses those bytes and returns `completed` for each, with the redacted row id
+  left redacted. Mutating the gate to bind identity to the row `id` again fails those
+  tests.
+- Declared-check evidence is redacted for known secret environment values before it
+  reaches the caller, and `result.json` carries the same object. When the wrapper
+  redacts `checked_at_url` or `checked_at_title` a second time, `capture_metadata`
+  records `returned_length` beside the runtime's own `length` and `truncated`, so the
+  metadata never describes a string the caller did not receive.
+
+Not established by any of this:
+
+- No live model run has used `checks` yet. The binding of a model-driven form fill to a
+  declared check has not been exercised end to end.
+- A passing check is DOM evidence at one instant. It is not proof of backend
+  persistence, and the two earlier live form failures below are not affected by it.
+- The group ran on macOS only, against a loopback fixture, in headless Chrome.
+
 ## Re-run deterministic checks
 
 From the installed Jev skill directory:
@@ -118,8 +255,29 @@ uv run python -m unittest discover -s tests -v
 uv run --project runtime --frozen python runtime/tests/run_tests.py --group unit
 ```
 
-These commands require no model key and make no paid model calls. The two real-runtime
-wrapper tests skip if runtime setup has not been completed.
+These commands require no model key and make no paid model calls. The three
+real-runtime wrapper tests skip if runtime setup has not been completed.
+
+`uv sync --project runtime --frozen` installs the vendored `jev-ultrafast` package
+non-editably from `runtime/vendor/jev-ultrafast`. Nothing in the declared-check work
+touches that package, so no reinstall is needed for it. If you do change a vendored
+file, force the copy in the runtime environment to be rebuilt:
+
+```sh
+uv sync --project runtime --frozen --reinstall-package jev-ultrafast
+```
+
+The wrapper package is installed editably from `src/`, so `src/jev/checks.py` is picked
+up without a reinstall. The runner loads that same file by path, so an installed copy
+must always contain both `src/` and `runtime/`; `install.py` copies them together and a
+test in the repository's `tests/test_install.py` checks that.
+
+The declared-check group starts its own headless Chrome and its own browser-harness
+daemon on a temporary profile. It opens no window and makes no model call:
+
+```sh
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+```
 
 The following additional groups open real Chrome windows and use a loopback fixture.
 They make no model calls. Run them only on a host where opening Chrome is appropriate:
@@ -129,16 +287,20 @@ uv run --project runtime --frozen python runtime/tests/run_tests.py --group brow
 uv run --project runtime --frozen python runtime/tests/run_tests.py --group login
 ```
 
-`--group all` ran all 146 runtime checks on 2026-09-21. The unit group is now 148
-checks. The browser and login groups were not re-run on 2026-09-22, so no new all-groups
-total is claimed. Raw local screenshots, browser profiles, provider logs and Prime Agent
-transcripts are not included in the public repository.
+`--group all` ran all 146 runtime checks on 2026-09-21, before the unit group grew. The
+unit group is now 288 checks and the `checks` group is 51. The browser and login
+groups were not re-run after the follow-up, so no new all-groups total is claimed. Raw
+local screenshots, browser profiles, provider logs and Prime Agent transcripts are not
+included in the public repository.
 
 ## Remaining limits
 
 - Exact field fidelity is not guaranteed by a model completion claim. Supplied values
   are copied byte for byte once bound, but no live run has yet checked a bound value,
   a cleared field or a skipped field against server state.
+- A declared DOM check is browser evidence inside the scope the caller declared. It is
+  not a verified goal, not a backend readback, and a `completed` status still means the
+  executor claimed completion. The two form failures above are not retired by it.
 - No production accounts, native mobile devices, uploads, complex iframe or shadow-DOM
   flows, or broad real-site reliability test was performed.
 - Model costs are soft limits, checked between calls. Unknown usage stops execution.
