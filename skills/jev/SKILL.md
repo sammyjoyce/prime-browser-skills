@@ -229,6 +229,10 @@ banner and a filled field prove what the page showed at one instant, not that a 
 stored anything. For writes, still read the saved state back through an independent
 path, exactly as `web-interaction-qa` requires.
 
+`scope`, `boundary`, `note` and `consistency`, and each row's `boundary`, are the
+contract's own constants. A result that widens any of them, for example a row claiming
+`boundary: "server_confirmed"`, raises `jev.JevProtocolError` instead of reaching you.
+
 ### Evidence sensitivity and timing
 
 - `count` counts every match, so a selector that is not unique inflates or deflates the
@@ -240,15 +244,25 @@ path, exactly as `web-interaction-qa` requires.
   written to `result.json`, redacted for known secret environment values and truncated
   at 2000 characters. A password input is refused and never returns a value, and so are
   `type=hidden` and file inputs. There is no generic hidden-field extraction.
-- Your own expectation is echoed in `verification.checks[].check`, so do not put a
-  secret in `equals` or `contains` either.
+- Your declaration is not echoed back. Each row carries `fingerprint`, the SHA-256 of
+  the normalized check it answers, and jev rejects a result whose ordered row
+  fingerprints are not the ones it declared. Rows arrive in declaration order, so
+  `verification["checks"][i]` answers your check `i`.
+- The runner redacts its whole result in one pass, so an `id` or an expectation that
+  looks like a credential comes back rewritten. A row `id` is a display label for that
+  reason; the fingerprint is what binds a row to a declaration, and a hex digest is
+  not something a credential pattern rewrites. The fingerprint detects a mismatched
+  declaration. It is not a signature, and it proves nothing about a runner that
+  decides to lie.
 - The checks run once, after execution and before teardown, in one synchronous read, so
   the rows agree with each other and with `checked_at_url`. They are a snapshot of the
   end state, not a per-action assertion: a page that navigates or updates afterwards is
   not covered, and `captured_at_ms` records when the read happened.
 - `checked_at_url` (at most 2048 characters) and `checked_at_title` (at most 2000) stay
-  strings. `capture_metadata` records each field's length and whether it was truncated
-  or redacted. The discarded tail is not stored.
+  strings. `capture_metadata` records each field's `length` and `truncated` as the
+  runtime measured them. When jev redacts one of the two again on the way out, that
+  field also gets `redacted: true` and `returned_length`, the length of the string you
+  actually receive. The discarded tail is not stored.
 - They also run after a partial stop (blocked, max_steps, cost limit, timeout,
   cancellation) whenever the browser is still alive, because that is when the page state
   matters most. They are read-only, so this changes nothing about a failed run.

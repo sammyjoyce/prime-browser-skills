@@ -666,15 +666,46 @@ def test_declared_check_contract(runner):
 
     declared = contract.normalize_checks(
         [{"id": "saved", "kind": "text", "selector": "#s", "equals": "Saved"}])[0]
-    check("checks.same_declaration_accepts_the_snapshot",
-          contract.same_declaration(dict(declared), declared))
-    check("checks.same_declaration_rejects_a_different_equals",
-          not contract.same_declaration({**declared, "equals": "Other"}, declared))
-    check("checks.same_declaration_rejects_a_different_selector",
-          not contract.same_declaration({**declared, "selector": "#other"}, declared))
-    check("checks.same_declaration_rejects_missing_or_extra",
-          not contract.same_declaration(None, declared)
-          and not contract.same_declaration({**declared, "script": "1"}, declared))
+    fingerprint = contract.declaration_fingerprint(declared)
+    check("checks.fingerprint_is_a_sha256_digest",
+          isinstance(fingerprint, str) and len(fingerprint) == contract.FINGERPRINT_CHARS
+          and all(character in "0123456789abcdef" for character in fingerprint),
+          fingerprint)
+    check("checks.fingerprint_is_stable",
+          fingerprint == contract.declaration_fingerprint(dict(declared))
+          and fingerprint == contract.declaration_fingerprint(
+              {"kind": "text", "id": "saved", "equals": "Saved", "selector": "#s"}))
+    changed = [
+        ("equals", {**declared, "equals": "Other"}),
+        ("selector", {**declared, "selector": "#other"}),
+        ("id", {**declared, "id": "other"}),
+        ("kind", {**declared, "kind": "value"}),
+        ("contains", {"id": "saved", "kind": "text", "selector": "#s", "contains": "Saved"}),
+    ]
+    differing = [name for name, other in changed
+                 if contract.declaration_fingerprint(other) == fingerprint]
+    check("checks.fingerprint_changes_with_the_declaration", not differing, str(differing))
+    rejected = (("none", None), ("list", [declared]), ("extra_key", {**declared, "script": "1"}))
+    for name, payload in rejected:
+        expect_raises("checks.fingerprint_rejects." + name, contract.CheckError,
+                      lambda payload=payload: contract.declaration_fingerprint(payload))
+
+    # The whole result goes through one redaction pass on the way out, so a
+    # row's link to its declaration has to survive that pass. A hex digest
+    # holds no "sk-" or "bearer" literal, and these two placeholders are
+    # synthetic: no environment value is read here.
+    key_shaped = contract.normalize_checks([
+        {"id": "bearer", "kind": "text", "selector": "#s", "contains": "Bearer YOUR_TOKEN_HERE"},
+        {"id": "key", "kind": "value", "selector": "#k",
+         "equals": "sk-EXAMPLE_PLACEHOLDER_00000000"},
+    ])
+    shaped = [contract.declaration_fingerprint(item) for item in key_shaped]
+    transported = json.loads(runner.redact(json.dumps(
+        contract.verification_payload(key_shaped, redact=runner.redact))))
+    check("checks.fingerprint_survives_the_runner_redaction",
+          [runner.redact(item) for item in shaped] == shaped
+          and [row["fingerprint"] for row in transported["checks"]] == shaped,
+          json.dumps(transported["checks"])[:200])
     check("checks.tally_counts_each_status",
           contract.tally([{"status": "passed"}, {"status": "failed"}, {"status": "failed"},
                           {"status": "unknown"}])
@@ -800,6 +831,19 @@ def test_declared_check_evidence(runner):
           "not evidence that a server stored anything" in payload["note"])
     check("checks.rows_keep_their_ids",
           [row["id"] for row in payload["checks"]] == ["url", "title", "heading", "email", "rows"])
+    check("checks.rows_fingerprint_their_declaration",
+          [row["fingerprint"] for row in payload["checks"]]
+          == [contract.declaration_fingerprint(item) for item in checks])
+    check("checks.rows_do_not_echo_the_declaration",
+          not [row for row in payload["checks"] if "check" in row]
+          and SECRET_EXPECTATION not in json.dumps(contract.verification_payload(
+              contract.normalize_checks([{"id": "s", "kind": "value", "selector": "#c",
+                                          "equals": SECRET_EXPECTATION}]),
+              evidence({"available": True, "value": "something else"}))))
+    check("checks.note_is_the_contract_note", payload["note"] == contract.NOTE)
+    check("checks.consistency_is_from_the_closed_set",
+          payload["consistency"] in contract.CONSISTENCY
+          and contract.verification_payload([])["consistency"] in contract.CONSISTENCY)
     check("checks.declared_count", payload["declared"] == 5
           and payload["counts"] == {"passed": 5, "failed": 0, "unknown": 0})
 
@@ -1753,6 +1797,7 @@ def test_declared_checks_through_a_real_runner_process(runner):
     than silently dropped. The second request proves the runner re-validates
     the contract itself, in its own process, after the wrapper already has.
     """
+    contract = runner.dom_checks
     work = Path(tempfile.mkdtemp(prefix="jev-checks-runner-")).resolve()
     try:
         env = os.environ.copy()
@@ -1760,8 +1805,13 @@ def test_declared_checks_through_a_real_runner_process(runner):
             env.pop(name, None)
         check("runner_process.no_key_is_set", not env.get("OPENROUTER_API_KEY"))
         artifacts = work / "artifacts"
+        # The third declaration is credential-shaped on purpose: a synthetic
+        # placeholder that the runner's own redaction would rewrite if it were
+        # echoed back. It must not change the run's outcome.
         declared = [{"id": "landed", "kind": "url", "contains": "/done"},
-                    {"id": "rows", "kind": "count", "selector": ".row", "equals": 3}]
+                    {"id": "rows", "kind": "count", "selector": ".row", "equals": 3},
+                    {"id": "auth", "kind": "text", "selector": "#s",
+                     "contains": "Bearer YOUR_TOKEN_HERE"}]
         request = {
             "op": "run", "task": "do the thing", "url": "http://127.0.0.1:9/",
             "profile_dir": str(work / "profile"), "artifact_dir": str(artifacts),
@@ -1774,16 +1824,26 @@ def test_declared_checks_through_a_real_runner_process(runner):
         verification = (payload or {}).get("verification") or {}
         check("runner_process.declared_checks_are_unknown",
               verification.get("status") == "unknown"
-              and verification.get("declared") == 2
+              and verification.get("declared") == 3
               and verification.get("scope") == "declared_dom_checks_only"
               and [row["reason"] for row in verification.get("checks", [])]
-              == ["verification_not_attempted"] * 2,
+              == ["verification_not_attempted"] * 3,
               json.dumps(verification)[:300])
+        expected = [contract.declaration_fingerprint(item)
+                    for item in contract.normalize_checks(declared)]
+        check("runner_process.rows_fingerprint_their_declarations",
+              [row.get("fingerprint") for row in verification.get("checks", [])] == expected,
+              json.dumps(verification.get("checks", []))[:300])
+        check("runner_process.the_declaration_is_not_echoed_back",
+              "Bearer YOUR_TOKEN_HERE" not in out
+              and not [row for row in verification.get("checks", []) if "check" in row],
+              out[-200:])
         check("runner_process.no_browser_started", not (artifacts / "chrome.log").exists())
         saved = json.loads((artifacts / "result.json").read_text())
         check("runner_process.result_json_carries_the_evidence",
-              saved["verification"]["declared"] == 2
-              and len(saved["verification"]["checks"]) == 2)
+              saved["verification"]["declared"] == 3
+              and len(saved["verification"]["checks"]) == 3
+              and "Bearer YOUR_TOKEN_HERE" not in json.dumps(saved))
 
         rejected = dict(request, artifact_dir=str(work / "artifacts-2"),
                         checks=[{"kind": "attribute", "selector": "a", "equals": "x"}])

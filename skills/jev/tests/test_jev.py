@@ -447,6 +447,64 @@ class SuccessPathTests(FakeRunnerTestCase):
         self.assertTrue(result["output"]["completion_claimed"])
         self.assertEqual(result["status"], "completed")
 
+    def test_rows_name_their_declaration_and_do_not_echo_it(self):
+        declared = [{"id": "done", "kind": "url", "equals": "https://example.test/done"},
+                    {"id": "rows", "kind": "count", "selector": ".r", "equals": 3}]
+        rows = self.go(checks=declared)["verification"]["checks"]
+        self.assertEqual(
+            [row["fingerprint"] for row in rows],
+            [jev.checks.declaration_fingerprint(check)
+             for check in jev.normalize_checks(declared)],
+        )
+        for row in rows:
+            self.assertNotIn("check", row, "the declaration is not echoed back")
+            self.assertEqual(row["boundary"], jev.CHECK_BOUNDARY)
+
+    def test_a_credential_shaped_declaration_still_completes(self):
+        """The runner redacts its whole result, declared text included.
+
+        A row whose id or expectation looks like a credential comes back
+        rewritten. The run must still complete, and nothing restores the
+        original text.
+        """
+        literals = ["Bearer YOUR_TOKEN_HERE", "sk-EXAMPLE_PLACEHOLDER_00000000"]
+        declared = [
+            {"id": "auth", "kind": "text", "selector": "#s", "contains": literals[0]},
+            {"id": "key " + literals[1], "kind": "value", "selector": "#k",
+             "equals": literals[1]},
+        ]
+        with env_set(FAKE_REDACT_LITERALS=json.dumps(literals)), \
+                self.mode("checks_redacted_transport"):
+            result = self.go(checks=declared)
+        payload = result["verification"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(
+            [row["fingerprint"] for row in payload["checks"]],
+            [jev.checks.declaration_fingerprint(check)
+             for check in jev.normalize_checks(declared)],
+        )
+        self.assertEqual(payload["checks"][1]["id"], "key " + jev._REDACTED)
+        blob = json.dumps(result)
+        for literal in literals:
+            self.assertNotIn(literal, blob)
+
+    def test_a_second_redaction_says_what_it_returned(self):
+        """capture_metadata must describe the string the caller receives."""
+        declared = [{"id": "saved", "kind": "text", "selector": "#s", "equals": "Saved"}]
+        with env_set(LEAK_TEST_TOKEN=SECRET), self.mode("checks_capture_metadata"):
+            payload = self.go(checks=declared)["verification"]
+        self.assertNotIn(SECRET, json.dumps(payload))
+        for key, name in (("checked_at_url", "url"), ("checked_at_title", "title")):
+            with self.subTest(field=name):
+                field = payload["capture_metadata"][name]
+                self.assertIn(jev._REDACTED, payload[key])
+                self.assertTrue(field["redacted"])
+                self.assertEqual(field["returned_length"], len(payload[key]))
+                # length stays the runtime's own measurement, and says so.
+                self.assertNotEqual(field["length"], field["returned_length"])
+                self.assertFalse(field["truncated"])
+
     def test_no_declared_check_is_not_run_and_changes_nothing(self):
         result = self.go()
         self.assertEqual(result["verification"]["status"], "not_run")
@@ -674,16 +732,26 @@ class FailurePathTests(FakeRunnerTestCase):
         self.assertIn("login declares no DOM check", ctx.exception.message)
 
     FORGED_TWISTS = (
-        ("wrong_id", "must describe declared check"),
-        ("wrong_kind", "must describe declared check"),
-        ("wrong_spec", ".check does not match"),
-        ("missing_spec", ".check is missing"),
+        ("foreign_declaration", ".fingerprint does not name the check"),
+        ("wrong_fingerprint", ".fingerprint does not name the check"),
+        ("missing_fingerprint", ".fingerprint is missing"),
+        ("malformed_fingerprint", ".fingerprint is missing"),
+        ("wrong_kind", ".kind must be the declared kind"),
+        ("row_id_type", ".id must be a string label"),
+        ("row_boundary", ".boundary must be 'browser_dom'"),
+        ("forged_note", "verification.note must be"),
+        ("forged_consistency", "verification.consistency must be one of"),
         ("bool_declared", "declared must be the integer"),
         ("bool_counts", "counts must tally"),
         ("wrong_counts", "counts must tally"),
         ("wrong_aggregate", "summarize(rows)"),
         ("row_status", "passed, failed, unknown"),
         ("bare_row", "must be an object"),
+    )
+    # Twists that need two declared checks to be forgeries at all.
+    PAIR_TWISTS = (
+        ("dup_rows", ".fingerprint does not name the check"),
+        ("swapped_rows", ".fingerprint does not name the check"),
     )
 
     def _declared_text_check(self):
@@ -697,8 +765,11 @@ class FailurePathTests(FakeRunnerTestCase):
                                          checks=declared)
                 self.assertIn(fragment, err.message)
         two = declared + [{"id": "rows", "kind": "count", "selector": ".r", "equals": 3}]
-        err = self.assert_status("checks_twist_dup_rows", "protocol", JevProtocolError, checks=two)
-        self.assertIn("must describe declared check", err.message)
+        for name, fragment in self.PAIR_TWISTS:
+            with self.subTest(twist=name):
+                err = self.assert_status("checks_twist_" + name, "protocol",
+                                         JevProtocolError, checks=two)
+                self.assertIn(fragment, err.message)
 
     def test_forged_partial_verification_is_a_protocol_error(self):
         declared = self._declared_text_check()
@@ -735,7 +806,7 @@ class FailurePathTests(FakeRunnerTestCase):
         declared = self._declared_text_check()
         err = self.assert_status("checks_noshot_corrupt", "protocol", JevProtocolError,
                                  checks=declared)
-        self.assertIn("must describe declared check", err.message)
+        self.assertIn(".fingerprint does not name the check", err.message)
         self.assertEqual(err.result["status"], "completed")
 
     def test_completed_without_a_real_png_is_an_artifact_error(self):
@@ -835,8 +906,12 @@ class VerificationContractTests(unittest.TestCase):
         for check in checks:
             if check["kind"] == "count":
                 value = 0 if failed else check["equals"]
+            elif failed:
+                value = "a value the page never showed"
+            elif "equals" in check:
+                value = check["equals"]
             else:
-                value = "nope" if failed else check.get("equals") or "seen"
+                value = "saw " + check["contains"]
             if unknown:
                 rows.append({"available": False, "reason": "page_unavailable"})
             else:
@@ -878,10 +953,11 @@ class VerificationContractTests(unittest.TestCase):
 
     def test_reviewer_forged_completed_payloads_are_rejected(self):
         import fake_runner
-        cases = FailurePathTests.FORGED_TWISTS + (("dup_rows", "must describe declared check"),)
+        pair = {name for name, _fragment in FailurePathTests.PAIR_TWISTS}
+        cases = FailurePathTests.FORGED_TWISTS + FailurePathTests.PAIR_TWISTS
         for name, fragment in cases:
             with self.subTest(twist=name):
-                checks = self.two if name == "dup_rows" else self.one
+                checks = self.two if name in pair else self.one
                 base = self._honest(checks)
                 twisted = fake_runner.twist_verification(base, name)
                 self._protocol(self._obj(twisted), checks, fragment)
@@ -932,18 +1008,88 @@ class VerificationContractTests(unittest.TestCase):
         payload["declared"] = True
         self._protocol(self._obj(payload), self.one, "declared must be the integer 1")
 
-    def test_missing_nested_check_and_mismatched_declaration(self):
-        payload = self._honest(self.one)
-        payload["checks"][0] = dict(payload["checks"][0])
-        payload["checks"][0].pop("check")
-        self._protocol(self._obj(payload), self.one, ".check is missing")
-        payload = self._honest(self.one)
-        nested = dict(payload["checks"][0]["check"])
-        nested["equals"] = "other"
-        payload["checks"][0] = dict(payload["checks"][0], check=nested)
-        err = self._protocol(self._obj(payload), self.one, ".check does not match")
-        self.assertNotIn("Saved", err.message)
-        self.assertNotIn("other", err.message)
+    def _transported(self, payload, literals):
+        """The payload as a transport that rewrites text would deliver it.
+
+        The runner emits redact(json.dumps(result)), so one redaction pass
+        reaches every string in the result, the caller's own declared text
+        included. The literals come from the test: nothing here copies the
+        runtime's patterns and no real environment value is involved.
+        """
+        blob = json.dumps(payload)
+        for literal in literals:
+            blob = blob.replace(literal, jev._REDACTED)
+        return json.loads(blob)
+
+    def test_a_missing_or_malformed_fingerprint_is_rejected(self):
+        for name, mutate in (("missing", lambda row: row.pop("fingerprint")),
+                             ("null", lambda row: row.update(fingerprint=None)),
+                             ("short", lambda row: row.update(fingerprint="abc123")),
+                             ("not_hex", lambda row: row.update(
+                                 fingerprint="z" * jev.checks.FINGERPRINT_CHARS)),
+                             ("nested", lambda row: row.update(fingerprint={"v": 1}))):
+            with self.subTest(shape=name):
+                payload = self._honest(self.one)
+                payload["checks"][0] = dict(payload["checks"][0])
+                mutate(payload["checks"][0])
+                self._protocol(self._obj(payload), self.one, ".fingerprint is missing")
+
+    def test_a_row_must_fingerprint_the_declaration_at_its_position(self):
+        """A changed selector, expectation, id, kind or order is a mismatch."""
+        others = [
+            [{"id": "saved", "kind": "text", "selector": "#s", "equals": "Other"}],
+            [{"id": "saved", "kind": "text", "selector": "#other", "equals": "Saved"}],
+            [{"id": "saved", "kind": "text", "selector": "#s", "contains": "Saved"}],
+            [{"id": "another-id", "kind": "text", "selector": "#s", "equals": "Saved"}],
+            [{"id": "saved", "kind": "value", "selector": "#s", "equals": "Saved"}],
+        ]
+        for other in others:
+            with self.subTest(declared=repr(other[0])[:70]):
+                checks = jev.normalize_checks(other)
+                err = self._protocol(self._obj(self._honest(checks)), self.one,
+                                     ".fingerprint does not name the check")
+                # The message names the position and the kind, never a value.
+                self.assertNotIn("Saved", err.message)
+                self.assertNotIn("Other", err.message)
+                self.assertNotIn("#s", err.message)
+        swapped = self._honest(self.two)
+        swapped["checks"] = [swapped["checks"][1], swapped["checks"][0]]
+        self._protocol(self._obj(swapped), self.two, ".fingerprint does not name the check")
+
+    def test_a_redacted_declaration_still_verifies_on_every_row_status(self):
+        """The blocker: credential-shaped declared text is rewritten in transit.
+
+        The row still names its declaration, because the fingerprint is a hex
+        digest computed before transport, so an honest result is not turned
+        into a protocol error.
+        """
+        literals = ["Bearer YOUR_TOKEN_HERE", "sk-EXAMPLE_PLACEHOLDER_00000000"]
+        checks = jev.normalize_checks([
+            {"id": "auth " + literals[0], "kind": "text", "selector": "#s",
+             "contains": literals[0]},
+            {"id": "key", "kind": "value", "selector": "#k", "equals": literals[1]},
+        ])
+        for kwargs, expected in ((dict(), "passed"), (dict(failed=True), "failed"),
+                                 (dict(unknown=True), "unknown")):
+            with self.subTest(status=expected):
+                payload = self._transported(self._honest(checks, **kwargs), literals)
+                self.assertEqual(payload["checks"][0]["id"], "auth " + jev._REDACTED)
+                result = self._finish(self._obj(payload), checks)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["verification"]["status"], expected)
+                blob = json.dumps(result["verification"])
+                for literal in literals:
+                    self.assertNotIn(literal, blob)
+
+    def test_a_forged_row_is_still_rejected_after_redaction(self):
+        """Redaction tolerance is not a hole: the fingerprint still decides."""
+        literal = "Bearer YOUR_TOKEN_HERE"
+        checks = jev.normalize_checks(
+            [{"id": "auth", "kind": "text", "selector": "#s", "contains": literal}])
+        other = jev.normalize_checks(
+            [{"id": "auth", "kind": "text", "selector": "#s", "contains": literal + "-x"}])
+        payload = self._transported(self._honest(other), [literal])
+        self._protocol(self._obj(payload), checks, ".fingerprint does not name the check")
 
 
 class LifecycleTests(FakeRunnerTestCase):

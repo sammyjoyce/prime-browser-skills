@@ -112,15 +112,17 @@ change exists. Neither is marked fixed. Deterministic tests do not retire them.
 
 ## Declared DOM checks (deterministic, including real headless Chrome)
 
-Date: 2026-09-22, remeasured after the protocol-consistency follow-up. Scope: the
+Date: 2026-09-22, remeasured after the row-fingerprint follow-up. Scope: the
 `checks` argument on `jev.run`, the shared contract file `src/jev/checks.py`,
 `runner.verify_declared_checks`, and the new `result["verification"]` object. This did
 not change the agent loop, the vendored fork, the provider path, the lifecycle or any
 existing argument. The 2026-09-22 landing measured 75 wrapper tests and 273 unit
 checks; the follow-up that correlates returned rows with declarations, validates
 non-completed verification objects, and records URL/title truncation remeasured 86
-wrapper tests and 281 unit checks. Historical 2026-09-21 package counts stay in the
-table above.
+wrapper tests and 281 unit checks. The row-fingerprint follow-up, which stopped the
+correspondence gate from comparing the runner's redacted echo of the declaration,
+measures 94 wrapper tests, 288 unit checks and 51 `checks`-group checks. Historical
+2026-09-21 package counts stay in the table above.
 
 Unlike exact-value binding, this change has live browser evidence, because a declared
 check is deterministic: it needs a page, not a model. The `checks` group starts its own
@@ -130,9 +132,9 @@ model request and needs no API key.
 
 | Check | Result |
 |---|---|
-| Wrapper suite, `tests/` (83 methods in `test_jev.py` plus 3 real-runtime cases) | 86 tests passed |
-| Runtime unit group | 281 checks passed |
-| Runtime `checks` group, real headless Chrome and one real runner process | 49 checks passed |
+| Wrapper suite, `tests/` (89 methods in `test_jev.py` plus 5 real-runtime cases) | 94 tests passed |
+| Runtime unit group | 288 checks passed |
+| Runtime `checks` group, real headless Chrome and one real runner process | 51 checks passed |
 | Vendor fork tests, `tests/test_agent.py` (unchanged by this follow-up) | 52 tests passed (2026-09-22; vendor tree not edited) |
 | Installer tests, repository `tests/` | 10 tests passed (2026-09-22; installer not edited) |
 
@@ -155,12 +157,17 @@ cd skills/jev/runtime/vendor/jev-ultrafast
 uv run ruff check --isolated --line-length 120 --select E,F,I   ../../../src/jev/checks.py ../../../src/jev/__init__.py ../../../runtime/runner.py   ../../../runtime/tests/run_tests.py ../../../runtime/tests/fixture_server.py   ../../../tests/test_jev.py ../../../tests/fake_runner.py   ../../../tests/test_runtime_launch.py
 ```
 
-It reports 25 findings and exits 1. The same command over the same files taken from the
-commit this branch starts at reports the same 25 findings, in the same files under the
-same rules: pre-existing long lines and the deliberate mid-file imports in
-`runtime/tests/run_tests.py`, plus one unused import in the repository's own
-`tests/test_install.py`. `src/jev/checks.py` reports nothing. This change adds no new
-finding; it also does not clean up the old ones.
+That command lists eight files. It reports 24 findings and exits 1, all of them in
+`runtime/runner.py` and `runtime/tests/run_tests.py`: 16 pre-existing long lines, 6
+deliberate mid-file imports (E402) and the 2 unsorted import blocks those cause. Run
+over the same eight files taken from the previous commit on this branch, it reports the
+same 24, in the same files under the same rules, so this change adds no new finding and
+cleans up none of the old ones. `src/jev/checks.py`, `src/jev/__init__.py` and the
+three test modules report nothing.
+
+An earlier revision of this section said 25. That count included one unused import in
+the repository's own `tests/test_install.py`, which the command above does not lint;
+that file still reports its single F401.
 
 The `checks` group runs two tests. The first starts the real runner process with
 declared checks and no `OPENROUTER_API_KEY`: the run stops before Chrome starts, and the
@@ -205,14 +212,30 @@ Mocked and unmocked contract evidence in the unit group and the wrapper suite:
 - A failed or unknown check leaves the run status `completed`, leaves
   `output["verification"]` at `"not_performed"`, and only adds a warning.
 - A result whose verification is missing, short, mis-scoped, mis-bounded, invalid,
-  `not_run` with declared checks, present with no declared check, whose rows do not
-  match the ordered declarations (id, kind, and the nested `check` snapshot), whose
-  `declared` count is not the integer length, or whose counts/aggregate disagree with
-  the rows is a protocol error in the wrapper. The same correspondence check runs on
-  completed results and on non-completed results (`max_steps`, `blocked`, missing
-  screenshot).
+  `not_run` with declared checks, present with no declared check, carrying a forged
+  `note` or `consistency`, whose rows do not fingerprint the ordered declarations or
+  disagree with them on kind or row boundary, whose `declared` count is not the integer
+  length, or whose counts/aggregate disagree with the rows is a protocol error in the
+  wrapper. The same correspondence check runs on completed results and on non-completed
+  results (`max_steps`, `blocked`, missing screenshot). The 14 single-row twists and
+  the 2 two-row twists in `fake_runner.twist_verification` are each asserted twice:
+  through the fake runner subprocess and directly against `_finish_result`.
+- A row names its declaration with a SHA-256 fingerprint computed before transport, so
+  the runner's single redaction pass over its whole result cannot break the match. Two
+  tests prove it with real code rather than a stand-in. A real runner process with no
+  `OPENROUTER_API_KEY` returns `credentials_error` for `contains="Saved"` and for the
+  synthetic placeholders `Bearer YOUR_TOKEN_HERE` and
+  `sk-EXAMPLE_PLACEHOLDER_00000000` alike, never a protocol error. The runtime
+  interpreter also builds a passing, a failed and an unknown payload with its own
+  contract and writes exactly the bytes `emit()` would write, redaction included; the
+  wrapper parses those bytes and returns `completed` for each, with the redacted row id
+  left redacted. Mutating the gate to bind identity to the row `id` again fails those
+  tests.
 - Declared-check evidence is redacted for known secret environment values before it
-  reaches the caller, and `result.json` carries the same object.
+  reaches the caller, and `result.json` carries the same object. When the wrapper
+  redacts `checked_at_url` or `checked_at_title` a second time, `capture_metadata`
+  records `returned_length` beside the runtime's own `length` and `truncated`, so the
+  metadata never describes a string the caller did not receive.
 
 Not established by any of this:
 
@@ -265,7 +288,7 @@ uv run --project runtime --frozen python runtime/tests/run_tests.py --group logi
 ```
 
 `--group all` ran all 146 runtime checks on 2026-09-21, before the unit group grew. The
-unit group is now 281 checks and the `checks` group is 49. The browser and login
+unit group is now 288 checks and the `checks` group is 51. The browser and login
 groups were not re-run after the follow-up, so no new all-groups total is claimed. Raw
 local screenshots, browser profiles, provider logs and Prime Agent transcripts are not
 included in the public repository.

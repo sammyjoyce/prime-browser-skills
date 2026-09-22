@@ -135,7 +135,7 @@ result = await jev.run(task, url=start_url, profile="work", checks=[
     {"id": "errors", "kind": "count", "selector": ".field-error", "equals": 0},
 ])
 result["verification"]["status"]     # passed, failed, unknown or not_run
-result["verification"]["checks"][0]  # id, status, reason, observed evidence
+result["verification"]["checks"][0]  # id, status, reason, observed evidence, fingerprint
 ```
 
 The kinds are `url`, `title`, `text`, `value` and `count`, with `equals` or `contains`.
@@ -144,7 +144,9 @@ JavaScript. `result["verification"]["scope"]` is always `declared_dom_checks_onl
 this is a different field from `result["output"]["verification"]`, which stays
 `"not_performed"`. Only an observed mismatch is `failed`; missing, ambiguous or refused
 evidence is `unknown`. A failed check does not change the run status, and passing DOM
-evidence is not proof that a server stored anything.
+evidence is not proof that a server stored anything. Your declaration is not echoed
+back: each row carries the SHA-256 `fingerprint` of the check it answers, and a result
+whose ordered fingerprints are not the declared ones raises `jev.JevProtocolError`.
 
 A completed status means the executor claimed the task was done, the screenshot was
 saved, and cleanup succeeded. It is not independent proof. Check the real postcondition,
@@ -230,7 +232,7 @@ have grown since, with exact-value binding and declared DOM checks; the counts m
 on 2026-09-22 are 273 Jev runtime unit checks, 49 Jev runtime `checks`-group checks
 against real headless Chrome, 75 Jev wrapper tests, 52 Jev vendor tests, and 10
 installer tests. After the protocol-consistency follow-up on that layer, the remeasured
-counts are 281 Jev runtime unit checks, 49 `checks`-group checks, and 86 Jev wrapper
+counts are 288 Jev runtime unit checks, 51 `checks`-group checks, and 94 Jev wrapper
 tests; vendor and installer trees were not edited. None of them makes a model call.
 All except the `checks` group use fake runners or offline runtime paths; the `checks`
 group drives real headless Chrome against a loopback fixture. None of them establishes

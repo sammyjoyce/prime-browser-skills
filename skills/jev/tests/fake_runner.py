@@ -18,11 +18,35 @@ import signal
 import sys
 import time
 
+# The declared-check contract, the same module the wrapper and the real
+# runtime use. The fake computes real fingerprints with it, so a row here is
+# built exactly the way the runtime builds one.
+from jev.checks import NOTE, declaration_fingerprint
+
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+# A declaration the caller never makes, used to forge rows.
+FOREIGN_CHECK = {"id": "a-check-the-caller-never-declared", "kind": "url",
+                 "equals": "https://example.test/forged"}
 
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def emit_redacted(obj, literals):
+    """Emit like the real runner: one redaction pass over the whole blob.
+
+    runner.emit writes redact(json.dumps(result)), so redaction reaches every
+    string in the result, including strings the caller itself declared. The
+    literals come from the test, so nothing here duplicates the runtime's own
+    patterns and no real environment value is involved.
+    """
+    blob = json.dumps(obj)
+    for literal in literals:
+        blob = blob.replace(literal, "[REDACTED]")
+    sys.stdout.write(blob + "\n")
     sys.stdout.flush()
 
 
@@ -60,8 +84,9 @@ def verification_for(req, **overrides):
             "status": "passed",
             "reason": None,
             "boundary": "browser_dom",
-            "check": check,
-            "observed": {"available": True, "value": check.get("equals", "seen")},
+            "fingerprint": declaration_fingerprint(check),
+            "observed": {"available": True,
+                         "value": check.get("equals", check.get("contains", "seen"))},
             "captured_at_ms": 1737000000000,
         })
     payload = {
@@ -74,7 +99,7 @@ def verification_for(req, **overrides):
         "checked_at_title": "Done",
         "captured_at_ms": 1737000000000 if rows else None,
         "consistency": "single_synchronous_read" if rows else "not_read",
-        "note": "browser DOM observation; not proof a server stored anything",
+        "note": NOTE,
         "checks": rows,
     }
     payload.update(overrides)
@@ -86,34 +111,41 @@ def twist_verification(payload, name):
     payload = dict(payload)
     rows = [dict(row) if isinstance(row, dict) else row for row in (payload.get("checks") or [])]
     payload["checks"] = rows
-    if name == "wrong_id":
+    if name == "foreign_declaration":
+        # A whole row for a check the caller never declared.
         if rows:
-            nested = dict(rows[0].get("check") or {})
-            nested["id"] = "a-check-the-caller-never-declared"
-            nested["kind"] = "url"
-            nested.pop("selector", None)
-            nested.pop("contains", None)
-            nested["equals"] = "https://example.test/forged"
-            rows[0] = dict(rows[0], id=nested["id"], kind="url", check=nested)
+            rows[0] = dict(rows[0], id=FOREIGN_CHECK["id"], kind=FOREIGN_CHECK["kind"],
+                           fingerprint=declaration_fingerprint(FOREIGN_CHECK))
     elif name == "wrong_kind":
+        # The fingerprint still names the declaration; the display kind lies.
         if rows:
-            nested = dict(rows[0].get("check") or {})
-            nested["kind"] = "url" if nested.get("kind") != "url" else "title"
-            nested.pop("selector", None)
-            rows[0] = dict(rows[0], kind=nested["kind"], check=nested)
-    elif name == "wrong_spec":
+            rows[0] = dict(rows[0], kind="url" if rows[0].get("kind") != "url" else "title")
+    elif name == "wrong_fingerprint":
         if rows:
-            nested = dict(rows[0].get("check") or {})
-            if "equals" in nested:
-                nested["equals"] = "not-what-was-declared"
-            else:
-                nested["contains"] = "not-what-was-declared"
-            rows[0] = dict(rows[0], check=nested)
-    elif name == "missing_spec":
+            rows[0] = dict(rows[0], fingerprint=declaration_fingerprint(FOREIGN_CHECK))
+    elif name == "missing_fingerprint":
         if rows:
             row = dict(rows[0])
-            row.pop("check", None)
+            row.pop("fingerprint", None)
             rows[0] = row
+    elif name == "malformed_fingerprint":
+        if rows:
+            rows[0] = dict(rows[0], fingerprint="not-a-sha256-digest")
+    elif name == "row_id_type":
+        if rows:
+            rows[0] = dict(rows[0], id=None)
+    elif name == "row_boundary":
+        if rows:
+            rows[0] = dict(rows[0], boundary="server_confirmed")
+    elif name == "forged_note":
+        payload["note"] = "verified against the backend database"
+    elif name == "forged_consistency":
+        payload["consistency"] = "confirmed_by_server"
+    elif name == "swapped_rows":
+        # Real rows, wrong order: row i must answer the check declared at i.
+        if len(rows) > 1:
+            rows[0], rows[1] = rows[1], rows[0]
+            payload["checks"] = rows
     elif name == "bool_declared":
         payload["declared"] = True
     elif name == "bool_counts":
@@ -310,7 +342,8 @@ def main():
         payload = verification_for(req)
         payload.update(status="passed", declared=1, counts={"passed": 1, "failed": 0, "unknown": 0},
                        checks=[{"id": "invented", "kind": "url", "status": "passed",
-                                "reason": None, "boundary": "browser_dom", "check": {},
+                                "reason": None, "boundary": "browser_dom",
+                                "fingerprint": declaration_fingerprint(FOREIGN_CHECK),
                                 "observed": {"available": True, "value": "x"},
                                 "captured_at_ms": 1}])
         emit(ok_result(req, art, verification=payload))
@@ -350,6 +383,26 @@ def main():
                        counts={"passed": 0, "failed": 0, "unknown": len(payload["checks"])})
         emit(ok_result(req, art, verification=payload))
         return
+    if mode == "checks_redacted_transport":
+        # An honest result whose text is rewritten in transit, the way the
+        # runner's own redaction rewrites credential-shaped strings.
+        literals = json.loads(os.environ.get("FAKE_REDACT_LITERALS") or "[]")
+        emit_redacted(ok_result(req, art), literals)
+        return
+    if mode == "checks_capture_metadata":
+        # capture_metadata as the runtime reports it: this runner redacted
+        # nothing, so length/truncated describe exactly these two strings.
+        payload = verification_for(req)
+        url = "https://example.test/done?t=" + leak
+        title = "Done " + leak
+        payload["checked_at_url"] = url
+        payload["checked_at_title"] = title
+        payload["capture_metadata"] = {
+            "url": {"length": len(url), "truncated": False},
+            "title": {"length": len(title), "truncated": False},
+        }
+        emit(ok_result(req, art, verification=payload))
+        return
     if mode == "checks_leak":
         payload = verification_for(req)
         for row in payload["checks"]:
@@ -384,7 +437,8 @@ def main():
         return
     if mode == "checks_noshot_corrupt":
         emit(ok_result(req, art, screenshot_path=None,
-                       verification=twist_verification(verification_for(req), "wrong_id")))
+                       verification=twist_verification(verification_for(req),
+                                                       "foreign_declaration")))
         return
     if mode == "verified":
         emit(ok_result(req, art, verified=True))

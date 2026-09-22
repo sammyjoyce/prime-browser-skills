@@ -32,7 +32,15 @@ Python 3.12 while Prime Agent kernels may use 3.11. Do not install upstream into
   is a different field from `output["verification"]`, which stays `"not_performed"`.
   A failed or unknown check never changes the run status, and a passing check never
   claims backend persistence or goal verification. The wrapper correlates returned
-  rows with the normalized declarations on completed and non-completed results alike.
+  rows with the normalized declarations on completed and non-completed results alike,
+  and pins `note` and `consistency` to the contract's own values.
+- A row names its declaration with `fingerprint`, the SHA-256 of the normalized check,
+  computed at both boundaries before anything is serialized. The declaration itself is
+  never echoed back, so there is one source of truth and the runner's single redaction
+  pass over its whole result cannot turn an honest run into a protocol error. Identity
+  is the fingerprint, not the row `id`, which redaction may legitimately rewrite. The
+  fingerprint detects a mismatched declaration; it is not a signature and claims
+  nothing about a runner that lies.
 - Only an observed mismatch is `failed`. Missing, ambiguous, invisible, refused or
   unreadable evidence is `unknown`; no declared check is `not_run`.
 - Checks are read-only and run once, after execution and before teardown, including
@@ -87,6 +95,13 @@ validation and identical messages in the wrapper and in the runner, including un
 keys, duplicate ids, bool-as-count and non-finite numbers; the observed password and
 hidden-field values never returned; and evidence surviving into `result.json` and
 through the wrapper.
+
+Correspondence adds its own: a credential-shaped declaration keeping the run's real
+outcome through a real runner process and through the exact bytes `emit()` writes; a
+passing, failed and unknown result accepted after that redaction pass; and a changed
+selector, expectation, id, kind or row order, a missing or malformed fingerprint, a
+widened row boundary and a forged note or consistency each rejected as a protocol
+error.
 
 Do not claim every case passed unless VALIDATION.md points to its evidence. Changes to
 the runtime, the provider, the source pin or the vendor fork require both deterministic

@@ -40,10 +40,11 @@ result["verification"], a separate object from output["verification"]:
      "scope": "declared_dom_checks_only", "boundary": "browser_dom",
      "declared": 2, "counts": {"passed": 1, "failed": 0, "unknown": 1},
      "checked_at_url": ..., "checked_at_title": ...,
-     "capture_metadata": {"url"|"title": {"length", "truncated", "redacted"?}} | null,
+     "capture_metadata": {"url"|"title": {"length", "truncated", "redacted"?,
+                                          "returned_length"?}} | null,
      "captured_at_ms": ...,
      "consistency": "single_synchronous_read", "note": ...,
-     "checks": [{"id", "kind", "status", "reason", "boundary", "check",
+     "checks": [{"id", "kind", "status", "reason", "boundary", "fingerprint",
                  "observed", "captured_at_ms"}, ...]}
 
 status is "failed" only for an observed mismatch. Missing, ambiguous,
@@ -58,8 +59,16 @@ are returned, redacted for known secret environment values and truncated at
 2000 characters, so a check you declare can put page content in the result.
 checked_at_url is truncated at 2048 characters and checked_at_title at 2000;
 those two fields stay strings, and capture_metadata records length, whether
-either was cut, and whether redaction changed the text. The discarded tail
-is not stored anywhere in the payload.
+either was cut, whether redaction changed the text, and then the
+returned_length that redaction produced. The discarded tail is not stored
+anywhere in the payload.
+
+Your declaration is not echoed back. Each row carries "fingerprint", the
+SHA-256 of the normalized check it answers, and the wrapper rejects a result
+whose ordered row fingerprints are not the ones it declared. Rows come back in
+declaration order, so row i answers checks[i]. A row "id" is a display label:
+it is the id you declared, except that the runner redacts its whole result, so
+an id that looks like a credential comes back redacted.
 
 Supplied values: values={"email": "dana@example.test"} binds exact strings to
 fields. A bound value is copied into the field byte for byte, with no trimming
@@ -146,10 +155,12 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from .checks import BOUNDARY as CHECK_BOUNDARY
+from .checks import CONSISTENCY as CHECK_CONSISTENCY
+from .checks import FINGERPRINT_CHARS, CheckError, declaration_fingerprint, normalize_checks, summarize, tally
+from .checks import NOTE as CHECK_NOTE
 from .checks import ROW_STATUSES as CHECK_ROW_STATUSES
 from .checks import SCOPE as CHECK_SCOPE
 from .checks import STATUSES as CHECK_STATUSES
-from .checks import CheckError, normalize_checks, same_declaration, summarize, tally
 
 try:
     import fcntl
@@ -701,6 +712,12 @@ def _redact_verification(payload: Any) -> Any:
     The runtime redacts the same strings with the same rule; doing it again
     here keeps the wrapper's stated contract true for every text field it
     returns, and redaction is idempotent.
+
+    capture_metadata.length and .truncated are the runtime's measurement of
+    the text it considered for storage. When this second pass changes the
+    stored string, that measurement no longer describes what the caller
+    receives, so the field also records returned_length, the length of the
+    string actually in the result.
     """
     if not isinstance(payload, dict):
         return payload
@@ -714,6 +731,7 @@ def _redact_verification(payload: Any) -> Any:
                 field = meta.get(meta_key)
                 if isinstance(field, dict):
                     field["redacted"] = True
+                    field["returned_length"] = len(payload[key])
     rows = payload.get("checks")
     if isinstance(rows, list):
         for row in rows:
@@ -734,15 +752,31 @@ def _counts_match(got: Any, expected: dict) -> bool:
     return True
 
 
+def _is_fingerprint(value: Any) -> bool:
+    """A SHA-256 hex digest as declaration_fingerprint() writes it."""
+    return (isinstance(value, str) and len(value) == FINGERPRINT_CHARS
+            and all(character in "0123456789abcdef" for character in value))
+
+
 def _check_verification(op: str, checks: list, result: dict, protocol_error) -> None:
     """The runner's verification object must describe exactly the declared checks.
 
     This is protocol consistency, not a proof that the browser told the truth:
-    every row must be a dict whose id, kind and nested `check` snapshot match
-    the normalized declaration at that index; row status is passed, failed or
+    every row must be a dict whose fingerprint is declaration_fingerprint() of
+    the normalized declaration at that index, whose kind and boundary are the
+    declared kind and "browser_dom", and whose status is passed, failed or
     unknown; declared is the integer length; counts tally the rows; aggregate
-    status equals summarize(rows). Zero checks allow only a missing object, or
+    status equals summarize(rows); scope, boundary, note and consistency are
+    the contract's own constants. Zero checks allow only a missing object, or
     not_run with empty rows.
+
+    Identity is the fingerprint, not the row's `id`. The runner emits its whole
+    result through one redaction pass, so a caller whose id or expectation
+    looks like a credential gets a rewritten id back; the fingerprint is a hex
+    digest computed before transport and no credential pattern can match it.
+    That also means a row `id` is a display label here: a runner that rewrites
+    one cannot be told apart from redaction, while a row that answers a
+    declaration the caller never made is rejected by its fingerprint.
 
     _FIELD_RULES already rejects a non-object, non-null verification value, so
     this function does not repeat that type check. It runs for every parsed
@@ -768,6 +802,17 @@ def _check_verification(op: str, checks: list, result: dict, protocol_error) -> 
     if payload.get("boundary") != CHECK_BOUNDARY:
         protocol_error(
             f"verification.boundary must be {CHECK_BOUNDARY!r}, got {payload.get('boundary')!r}"
+        )
+    if payload.get("consistency") not in CHECK_CONSISTENCY:
+        protocol_error(
+            "verification.consistency must be one of " + ", ".join(CHECK_CONSISTENCY)
+            + f", got {payload.get('consistency')!r}"
+        )
+    if payload.get("note") != CHECK_NOTE:
+        # Bounded: the note is a sentence, and a forged one may be anything.
+        protocol_error(
+            "verification.note must be the declared-check contract note, got "
+            f"{repr(payload.get('note'))[:80]}"
         )
     rows = payload.get("checks")
     if not isinstance(rows, list) or len(rows) != declared:
@@ -795,18 +840,30 @@ def _check_verification(op: str, checks: list, result: dict, protocol_error) -> 
         label = f"verification.checks[{index}]"
         if not isinstance(row, dict):
             protocol_error(f"{label} must be an object, got {type(row).__name__}")
-        if row.get("id") != check["id"] or row.get("kind") != check["kind"]:
+        fingerprint = row.get("fingerprint")
+        if not _is_fingerprint(fingerprint):
             protocol_error(
-                f"{label} must describe declared check id={check['id']!r} "
-                f"kind={check['kind']!r}, got id={row.get('id')!r} kind={row.get('kind')!r}"
+                f"{label}.fingerprint is missing or is not a declaration fingerprint"
             )
-        raw_check = row.get("check")
-        if not isinstance(raw_check, dict):
-            protocol_error(f"{label}.check is missing or not a check object")
-        if not same_declaration(raw_check, check):
+        if fingerprint != declaration_fingerprint(check):
             protocol_error(
-                f"{label}.check does not match the declared check "
-                f"id={check['id']!r} kind={check['kind']!r}"
+                f"{label}.fingerprint does not name the check declared at that position "
+                f"(kind={check['kind']!r})"
+            )
+        if row.get("kind") != check["kind"]:
+            protocol_error(
+                f"{label}.kind must be the declared kind {check['kind']!r}, "
+                f"got {row.get('kind')!r}"
+            )
+        if not isinstance(row.get("id"), str):
+            # A label, not an identity: redaction may rewrite it, but a
+            # redacted string is still a string.
+            protocol_error(
+                f"{label}.id must be a string label, got {type(row.get('id')).__name__}"
+            )
+        if row.get("boundary") != CHECK_BOUNDARY:
+            protocol_error(
+                f"{label}.boundary must be {CHECK_BOUNDARY!r}, got {row.get('boundary')!r}"
             )
         row_status = row.get("status")
         if row_status not in CHECK_ROW_STATUSES:

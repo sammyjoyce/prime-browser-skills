@@ -63,6 +63,41 @@ for checks in json.loads(sys.stdin.read()):
 sys.stdout.write(json.dumps(report))
 """
 
+# Also runs inside the real runtime interpreter: builds a verification payload
+# with the runner's own contract and writes exactly the bytes runner.emit()
+# would write for it, redaction included. Nothing is started; no key is read.
+EMIT_PROBE_SOURCE = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import runner
+
+spec = json.loads(sys.stdin.read())
+request = {"op": "run", "task": "t", "url": "http://127.0.0.1:9/",
+           "profile_dir": "/tmp/jev-emit-probe", "artifact_dir": "/tmp/jev-emit-probe"}
+checks = runner.normalize(dict(request, checks=spec["checks"]))["checks"]
+wires = []
+for case in spec["cases"]:
+    payload = runner.dom_checks.verification_payload(
+        checks, case["evidence"], redact=runner.redact)
+    result = {
+        "status": "completed",
+        "output": {"final_url": "https://app.test/done", "final_title": "Done",
+                   "page_text": "ok", "completion_claimed": True,
+                   "verification": "not_performed"},
+        "text": "done", "steps": 1, "cost": 0.0, "warnings": [],
+        "screenshot_path": spec["screenshot_path"],
+        "verification": payload,
+    }
+    # emit() writes redact(json.dumps(result, default=str)): one redaction
+    # pass over the whole blob, row ids and observed evidence included.
+    wires.append(runner.redact(json.dumps(result, default=str)))
+sys.stdout.write(json.dumps({"wires": wires}))
+"""
+
+# Synthetic, credential-shaped and non-secret: no real value is used here.
+BEARER_LITERAL = "Bearer YOUR_TOKEN_HERE"
+KEY_LITERAL = "sk-EXAMPLE_PLACEHOLDER_00000000"
+
 CONTRACT_CASES = [
     None,
     [],
@@ -154,6 +189,102 @@ class RuntimeLaunchTests(unittest.TestCase):
                         jev._validate_checks(case)
                     self.assertEqual(ctx.exception.message, outcome["error"],
                                      "both boundaries must reject with the same message")
+
+    def test_the_wrapper_accepts_the_bytes_the_runner_really_emits(self):
+        """Both halves, real code, on one byte string.
+
+        The runtime builds the verification payload with its own contract and
+        redacts the whole result the way emit() does; the wrapper then parses
+        exactly those bytes. A declaration that looks like a credential is
+        rewritten in transit, so this is the case that must not become a
+        protocol error. No browser, no key, no model call.
+        """
+        declared = [
+            {"id": "auth " + BEARER_LITERAL, "kind": "text", "selector": "#s",
+             "contains": BEARER_LITERAL},
+            {"id": "key", "kind": "value", "selector": "#k", "equals": KEY_LITERAL},
+        ]
+        cases = [
+            ("passed", [{"available": True, "value": "sent " + BEARER_LITERAL},
+                        {"available": True, "value": KEY_LITERAL}]),
+            ("failed", [{"available": True, "value": "no header at all"},
+                        {"available": True, "value": KEY_LITERAL}]),
+            ("unknown", [{"available": False, "reason": "missing_or_ambiguous"},
+                         {"available": False, "reason": "sensitive_field"}]),
+        ]
+        with tempfile.TemporaryDirectory(prefix="jev-emit-") as tmp:
+            root = Path(tmp)
+            shot = root / "final.png"
+            shot.write_bytes(jev._PNG_MAGIC + b"\x00" * 16)
+            probe = root / "emit_probe.py"
+            probe.write_text(EMIT_PROBE_SOURCE)
+            spec = {
+                "checks": declared,
+                "screenshot_path": str(shot),
+                "cases": [{"evidence": {"url": "https://app.test/done", "title": "Done",
+                                        "at": 1737000000000, "rows": rows}}
+                          for _status, rows in cases],
+            }
+            completed = subprocess.run(
+                [str(jev._runtime_python()), str(probe), str(jev._runtime_dir())],
+                input=json.dumps(spec),
+                capture_output=True, text=True, timeout=120, env=jev._child_env(),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+            wires = json.loads(completed.stdout)["wires"]
+            self.assertEqual(len(wires), len(cases))
+            checks = jev._validate_checks(declared)
+            fingerprints = [jev.checks.declaration_fingerprint(check) for check in checks]
+            for (expected, _rows), wire in zip(cases, wires):
+                with self.subTest(status=expected):
+                    # The transport really did rewrite the declared text.
+                    self.assertIn(jev._REDACTED, wire)
+                    self.assertNotIn(BEARER_LITERAL, wire)
+                    self.assertNotIn(KEY_LITERAL, wire)
+                    result = jev._finish_result(
+                        "run", wire.encode(), 0, root, root, root / "missing.log", checks)
+                    self.assertEqual(result["status"], "completed")
+                    payload = result["verification"]
+                    self.assertEqual(payload["status"], expected)
+                    self.assertEqual([row["fingerprint"] for row in payload["checks"]],
+                                     fingerprints)
+                    self.assertEqual(payload["checks"][0]["id"], "auth " + jev._REDACTED)
+                    self.assertNotIn(BEARER_LITERAL, json.dumps(payload))
+
+    def test_a_credential_shaped_declaration_keeps_the_real_failure(self):
+        """A real runner process, no key: the failure stays credentials_error.
+
+        Three declarations, one plain and two credential-shaped. The runner
+        stops before Chrome starts, reports every declared check as unknown,
+        and the shape of the declared text must not change that outcome.
+        """
+        expectations = ("Saved", BEARER_LITERAL, KEY_LITERAL)
+        with tempfile.TemporaryDirectory(prefix="jev-shaped-") as tmp:
+            home = Path(tmp) / "home"
+            with mock.patch.dict(os.environ, {"JEV_HOME": str(home)}):
+                os.environ.pop("OPENROUTER_API_KEY", None)
+                for expectation in expectations:
+                    with self.subTest(expectation=expectation[:12]):
+                        self.assertFalse(os.environ.get("OPENROUTER_API_KEY"),
+                                         "refusing to run: a provider key is still set")
+                        checks = [{"id": "auth", "kind": "text", "selector": "#s",
+                                   "contains": expectation}]
+                        with self.assertRaises(JevError) as ctx:
+                            asyncio.run(run("open the page", "http://127.0.0.1:9/",
+                                            profile="shaped", max_steps=1,
+                                            timeout_ms=120_000, max_cost_usd=0.01,
+                                            checks=checks))
+                        err = ctx.exception
+                        self.assertEqual(err.status, "credentials_error", err.message)
+                        self.assertNotIsInstance(err, jev.JevProtocolError)
+                        self.assertIn("OPENROUTER_API_KEY", err.message)
+                        row = err.result["verification"]["checks"][0]
+                        self.assertEqual(row["status"], "unknown")
+                        self.assertEqual(row["reason"], "verification_not_attempted")
+                        self.assertEqual(
+                            row["fingerprint"],
+                            jev.checks.declaration_fingerprint(
+                                jev._validate_checks(checks)[0]))
 
     def test_run_without_a_key_fails_typed_before_any_model_call(self):
         """No key means no browser and no provider request, twice in a row.

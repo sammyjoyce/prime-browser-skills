@@ -13,6 +13,9 @@ Honesty rules, in one place:
   one instant, after execution finished. It is not proof that a server stored
   anything, and it never turns an executor completion claim into a verified
   goal.
+- A row names the declaration it answers with declaration_fingerprint(), not
+  with a copy of the declaration. The caller keeps the only copy of its own
+  expectation, and the fingerprint survives a transport that rewrites text.
 - "failed" is only an observed mismatch. Missing, ambiguous, invisible,
   refused or unreadable evidence is "unknown", never "failed".
 - No declared check at all is "not_run", which is not a pass.
@@ -29,6 +32,7 @@ of the jev package: the runtime loads this same file directly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from typing import Any, Callable, Iterable
@@ -41,11 +45,14 @@ __all__ = [
     "STATUSES",
     "KINDS",
     "MAX_CHECKS",
+    "NOTE",
+    "CONSISTENCY",
+    "FINGERPRINT_CHARS",
+    "declaration_fingerprint",
     "normalize_checks",
     "read_expression",
     "summarize",
     "tally",
-    "same_declaration",
     "verification_payload",
 ]
 
@@ -53,6 +60,11 @@ SCOPE = "declared_dom_checks_only"
 BOUNDARY = "browser_dom"
 ROW_STATUSES = ("passed", "failed", "unknown")
 STATUSES = ROW_STATUSES + ("not_run",)
+# The closed vocabulary for `consistency`: the rows came from one synchronous
+# read of one document, or no read happened at all.
+NOT_READ = "not_read"
+SINGLE_READ = "single_synchronous_read"
+CONSISTENCY = (NOT_READ, SINGLE_READ)
 NOTE = (
     "browser DOM observation taken after execution, inside the declared scope only; "
     "not evidence that a server stored anything and not a verification of the task goal"
@@ -74,6 +86,10 @@ MAX_READ_CHARS = 20_000
 # Longest observed string copied into the result and into result.json.
 MAX_REPORTED_CHARS = 2_000
 MAX_REPORTED_URL_CHARS = 2_048
+# A declaration fingerprint is a SHA-256 hex digest: 64 lowercase hex
+# characters. Hex holds no whitespace and no "sk-" or "bearer" literal, so a
+# credential-shaped redaction pattern cannot rewrite one in transit.
+FINGERPRINT_CHARS = 64
 
 # Every reason a row can be unknown. A reason outside this set is not reported.
 REASONS = (
@@ -272,18 +288,28 @@ def tally(rows: list) -> dict:
     return counts
 
 
-def same_declaration(returned: Any, declared: dict) -> bool:
-    """True when a row's `check` object is the caller's normalized declaration.
+def declaration_fingerprint(check: Any) -> str:
+    """The fingerprint of one declared check: SHA-256 over canonical JSON.
 
-    Reuses normalize_checks so a fabricated same-id/same-kind object with a
-    different selector, equals or contains cannot pass. Extra keys fail too.
+    Both boundaries compute this from the same normalized declaration, before
+    anything is serialized for transport, so the wrapper can match a returned
+    row to the check it declared at that position without the row carrying a
+    copy of the expectation. normalize_checks() runs first, so the input is
+    validated and the digest cannot depend on key order, on a caller's extra
+    key, or on a value the contract would have rejected.
+
+    It detects a declaration that does not correspond to the caller's own, by
+    accident or by a runner that mixed rows up. It is not a signature and it
+    proves nothing about a runner that decides to lie: a deliberately
+    dishonest runner holds the declaration and can recompute the digest.
+
+    Raises CheckError when `check` is not a valid declaration.
     """
-    if not isinstance(returned, dict) or not isinstance(declared, dict):
-        return False
-    try:
-        return normalize_checks([returned]) == [declared]
-    except CheckError:
-        return False
+    canonical = json.dumps(
+        normalize_checks([check])[0],
+        sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _clean_text(value: str, redact: Callable[[str], str] | None, limit: int) -> dict:
@@ -301,7 +327,10 @@ def _capture_text(value: str, redact: Callable[[str], str] | None, limit: int) -
 
     The stored string is never longer than limit. Metadata talks about the
     redacted text (the value that was considered for storage), not a discarded
-    original, so an overlong raw value is not leaked.
+    original, so an overlong raw value is not leaked. `length` is therefore
+    what this process measured; the returned string is min(length, limit)
+    characters unless a later pass redacts it again, and that pass adds its
+    own `returned_length`.
     """
     text = redact(value) if redact is not None else value
     meta = {"length": len(text), "truncated": len(text) > limit}
@@ -320,14 +349,18 @@ def _unknown(row: dict, reason: str, extra: dict | None = None) -> dict:
     return row
 
 
-def _row(check: dict, evidence: Any, fallback: str, captured_at_ms, redact) -> dict:
+def _row(check: dict, fingerprint: Any, evidence: Any, fallback: str,
+         captured_at_ms, redact) -> dict:
     row = {
         "id": check["id"],
         "kind": check["kind"],
         "status": "unknown",
         "reason": None,
         "boundary": BOUNDARY,
-        "check": dict(check),
+        # Which declaration this row answers. The declaration itself is never
+        # echoed: the caller already has it, and a second copy would be a
+        # second source of truth that a transport can rewrite.
+        "fingerprint": fingerprint,
         "observed": None,
         "captured_at_ms": captured_at_ms,
     }
@@ -376,14 +409,14 @@ def verification_payload(
     url = title = None
     url_meta = title_meta = None
     captured_at_ms = None
-    consistency = "not_read"
+    consistency = NOT_READ
     evidence: list = [None] * len(checks)
 
     if checks and isinstance(payload, dict):
         rows = payload.get("rows")
         if isinstance(rows, list) and len(rows) == len(checks):
             evidence = rows
-            consistency = "single_synchronous_read"
+            consistency = SINGLE_READ
             raw_at = payload.get("at")
             if isinstance(raw_at, (int, float)) and not isinstance(raw_at, bool):
                 captured_at_ms = int(raw_at)
@@ -399,12 +432,16 @@ def verification_payload(
     rows = []
     for check, item in zip(checks, evidence):
         try:
-            rows.append(_row(check, item, reason, captured_at_ms, redact))
+            fingerprint = declaration_fingerprint(check)
+        except Exception:  # not a declaration this contract can name
+            fingerprint = None
+        try:
+            rows.append(_row(check, fingerprint, item, reason, captured_at_ms, redact))
         except Exception:  # one malformed row never erases the others
             rows.append({
                 "id": check.get("id"), "kind": check.get("kind"), "status": "unknown",
                 "reason": "evidence_unavailable", "boundary": BOUNDARY,
-                "check": dict(check) if isinstance(check, dict) else None,
+                "fingerprint": fingerprint,
                 "observed": {"available": False, "reason": "evidence_unavailable"},
                 "captured_at_ms": captured_at_ms,
             })
