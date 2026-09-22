@@ -664,6 +664,22 @@ def test_declared_check_contract(runner):
     source[0]["equals"] = "mutated"
     check("checks.snapshot_survives_caller_mutation", snapshot[0]["equals"] == "x")
 
+    declared = contract.normalize_checks(
+        [{"id": "saved", "kind": "text", "selector": "#s", "equals": "Saved"}])[0]
+    check("checks.same_declaration_accepts_the_snapshot",
+          contract.same_declaration(dict(declared), declared))
+    check("checks.same_declaration_rejects_a_different_equals",
+          not contract.same_declaration({**declared, "equals": "Other"}, declared))
+    check("checks.same_declaration_rejects_a_different_selector",
+          not contract.same_declaration({**declared, "selector": "#other"}, declared))
+    check("checks.same_declaration_rejects_missing_or_extra",
+          not contract.same_declaration(None, declared)
+          and not contract.same_declaration({**declared, "script": "1"}, declared))
+    check("checks.tally_counts_each_status",
+          contract.tally([{"status": "passed"}, {"status": "failed"}, {"status": "failed"},
+                          {"status": "unknown"}])
+          == {"passed": 1, "failed": 2, "unknown": 1})
+
     invalid = [
         ("not_a_list", {"id": "a", "kind": "url", "equals": "x"}),
         ("too_many", [{"kind": "url", "equals": "x"}] * (contract.MAX_CHECKS + 1)),
@@ -868,6 +884,47 @@ def test_declared_check_evidence(runner):
           and bounded["observed"]["truncated"] is True
           and bounded["observed"]["length"] == len(long_value)
           and bounded["status"] == "passed")
+
+    url_check = contract.normalize_checks([{"id": "u", "kind": "url", "equals": "nope"}])
+    exact_url = "u" * contract.MAX_REPORTED_URL_CHARS
+    exact_title = "t" * contract.MAX_REPORTED_CHARS
+    at_limit = contract.verification_payload(
+        url_check, evidence({"available": True, "value": "nope"},
+                            url=exact_url, title=exact_title))
+    check("checks.capture_fields_at_limit_are_not_truncated",
+          at_limit["checked_at_url"] == exact_url
+          and at_limit["checked_at_title"] == exact_title
+          and at_limit["capture_metadata"]["url"] == {
+              "length": contract.MAX_REPORTED_URL_CHARS, "truncated": False}
+          and at_limit["capture_metadata"]["title"] == {
+              "length": contract.MAX_REPORTED_CHARS, "truncated": False})
+
+    over_url = exact_url + "X"
+    over_title = exact_title + "Y"
+    over = contract.verification_payload(
+        url_check, evidence({"available": True, "value": "nope"},
+                            url=over_url, title=over_title))
+    dumped = json.dumps(over)
+    check("checks.capture_fields_one_over_are_truncated",
+          over["checked_at_url"] == exact_url
+          and over["checked_at_title"] == exact_title
+          and over["capture_metadata"]["url"] == {
+              "length": contract.MAX_REPORTED_URL_CHARS + 1, "truncated": True}
+          and over["capture_metadata"]["title"] == {
+              "length": contract.MAX_REPORTED_CHARS + 1, "truncated": True}
+          and over_url not in dumped and over_title not in dumped
+          and "X" not in over["checked_at_url"] and "Y" not in over["checked_at_title"])
+
+    secret_url = ("https://app.test/" + SECRET_EXPECTATION + "z") * 80
+    redacted_capture = contract.verification_payload(
+        url_check, evidence({"available": True, "value": "nope"}, url=secret_url,
+                            title="Done " + SECRET_EXPECTATION),
+        redact=lambda text: text.replace(SECRET_EXPECTATION, "[REDACTED]"))
+    check("checks.capture_fields_record_redaction_and_drop_the_secret",
+          SECRET_EXPECTATION not in json.dumps(redacted_capture)
+          and redacted_capture["capture_metadata"]["url"].get("redacted") is True
+          and redacted_capture["capture_metadata"]["title"].get("redacted") is True
+          and redacted_capture["capture_metadata"]["url"]["truncated"] is True)
 
     redacted = contract.verification_payload(
         contract.normalize_checks([{"id": "t", "kind": "text", "selector": "p",

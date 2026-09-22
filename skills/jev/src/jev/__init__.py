@@ -39,7 +39,9 @@ result["verification"], a separate object from output["verification"]:
     {"status": "passed"|"failed"|"unknown"|"not_run",
      "scope": "declared_dom_checks_only", "boundary": "browser_dom",
      "declared": 2, "counts": {"passed": 1, "failed": 0, "unknown": 1},
-     "checked_at_url": ..., "checked_at_title": ..., "captured_at_ms": ...,
+     "checked_at_url": ..., "checked_at_title": ...,
+     "capture_metadata": {"url"|"title": {"length", "truncated", "redacted"?}} | null,
+     "captured_at_ms": ...,
      "consistency": "single_synchronous_read", "note": ...,
      "checks": [{"id", "kind", "status", "reason", "boundary", "check",
                  "observed", "captured_at_ms"}, ...]}
@@ -54,6 +56,10 @@ server stored anything. A password input is refused (reason
 inputs are refused too. Observed values for text, value, count and url checks
 are returned, redacted for known secret environment values and truncated at
 2000 characters, so a check you declare can put page content in the result.
+checked_at_url is truncated at 2048 characters and checked_at_title at 2000;
+those two fields stay strings, and capture_metadata records length, whether
+either was cut, and whether redaction changed the text. The discarded tail
+is not stored anywhere in the payload.
 
 Supplied values: values={"email": "dana@example.test"} binds exact strings to
 fields. A bound value is copied into the field byte for byte, with no trimming
@@ -140,9 +146,10 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from .checks import BOUNDARY as CHECK_BOUNDARY
+from .checks import ROW_STATUSES as CHECK_ROW_STATUSES
 from .checks import SCOPE as CHECK_SCOPE
 from .checks import STATUSES as CHECK_STATUSES
-from .checks import CheckError, normalize_checks
+from .checks import CheckError, normalize_checks, same_declaration, summarize, tally
 
 try:
     import fcntl
@@ -697,9 +704,16 @@ def _redact_verification(payload: Any) -> Any:
     """
     if not isinstance(payload, dict):
         return payload
-    for key in ("checked_at_url", "checked_at_title"):
+    meta = payload.get("capture_metadata")
+    meta = meta if isinstance(meta, dict) else None
+    for key, meta_key in (("checked_at_url", "url"), ("checked_at_title", "title")):
         if isinstance(payload.get(key), str):
-            payload[key] = _redact(payload[key])
+            before = payload[key]
+            payload[key] = _redact(before)
+            if payload[key] != before and isinstance(meta, dict):
+                field = meta.get(meta_key)
+                if isinstance(field, dict):
+                    field["redacted"] = True
     rows = payload.get("checks")
     if isinstance(rows, list):
         for row in rows:
@@ -709,23 +723,41 @@ def _redact_verification(payload: Any) -> Any:
     return payload
 
 
-def _check_verification(op: str, declared: int, result: dict, protocol_error) -> None:
-    """A completed result must describe exactly the checks that were declared.
+def _counts_match(got: Any, expected: dict) -> bool:
+    """True when counts is exactly the tally, with real ints (not bools)."""
+    if not isinstance(got, dict) or set(got) != set(expected):
+        return False
+    for key, want in expected.items():
+        value = got[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value != want:
+            return False
+    return True
 
-    A failed or unknown check never changes the run's status: `completed` stays
-    an executor claim either way. What this enforces is that the runner cannot
-    report fewer rows than were declared, cannot invent a scope, and cannot
-    call a declared set of checks "not_run".
+
+def _check_verification(op: str, checks: list, result: dict, protocol_error) -> None:
+    """The runner's verification object must describe exactly the declared checks.
+
+    This is protocol consistency, not a proof that the browser told the truth:
+    every row must be a dict whose id, kind and nested `check` snapshot match
+    the normalized declaration at that index; row status is passed, failed or
+    unknown; declared is the integer length; counts tally the rows; aggregate
+    status equals summarize(rows). Zero checks allow only a missing object, or
+    not_run with empty rows.
+
+    _FIELD_RULES already rejects a non-object, non-null verification value, so
+    this function does not repeat that type check. It runs for every parsed
+    result, including non-completed statuses. A failed or unknown check never
+    changes the run's status: `completed` stays an executor claim.
     """
+    checks = list(checks or [])
+    declared = len(checks)
     payload = result.get("verification")
     if payload is None:
         if declared:
             protocol_error(
-                f"completed run declared {declared} DOM check(s) but returned no verification object"
+                f"run declared {declared} DOM check(s) but returned no verification object"
             )
         return
-    if not isinstance(payload, dict):
-        protocol_error(f"verification must be an object or null, got {type(payload).__name__}")
     status = payload.get("status")
     if status not in CHECK_STATUSES:
         protocol_error(
@@ -754,6 +786,47 @@ def _check_verification(op: str, declared: int, result: dict, protocol_error) ->
         protocol_error(
             f"verification.status must be 'not_run' with no declared check, got {status!r}"
         )
+    got_declared = payload.get("declared")
+    if isinstance(got_declared, bool) or not isinstance(got_declared, int) or got_declared != declared:
+        protocol_error(
+            f"verification.declared must be the integer {declared}, got {got_declared!r}"
+        )
+    for index, (row, check) in enumerate(zip(rows, checks)):
+        label = f"verification.checks[{index}]"
+        if not isinstance(row, dict):
+            protocol_error(f"{label} must be an object, got {type(row).__name__}")
+        if row.get("id") != check["id"] or row.get("kind") != check["kind"]:
+            protocol_error(
+                f"{label} must describe declared check id={check['id']!r} "
+                f"kind={check['kind']!r}, got id={row.get('id')!r} kind={row.get('kind')!r}"
+            )
+        raw_check = row.get("check")
+        if not isinstance(raw_check, dict):
+            protocol_error(f"{label}.check is missing or not a check object")
+        if not same_declaration(raw_check, check):
+            protocol_error(
+                f"{label}.check does not match the declared check "
+                f"id={check['id']!r} kind={check['kind']!r}"
+            )
+        row_status = row.get("status")
+        if row_status not in CHECK_ROW_STATUSES:
+            protocol_error(
+                f"{label}.status must be one of " + ", ".join(CHECK_ROW_STATUSES)
+                + f", got {row_status!r}"
+            )
+    expected_counts = tally(rows)
+    got_counts = payload.get("counts")
+    if not _counts_match(got_counts, expected_counts):
+        protocol_error(
+            "verification.counts must tally row statuses "
+            f"{expected_counts}, got {got_counts!r}"
+        )
+    expected_status = summarize(rows)
+    if status != expected_status:
+        protocol_error(
+            f"verification.status must equal summarize(rows) ({expected_status!r}), "
+            f"got {status!r}"
+        )
 
 
 def _finish_result(
@@ -763,7 +836,7 @@ def _finish_result(
     artifact_dir: Path,
     profile_dir: Path,
     stderr_path: Path,
-    declared_checks: int = 0,
+    checks: list | None = None,
 ) -> dict:
     """Parse, type-check and normalize the runner's single stdout JSON object."""
     raw = (stdout or b"").decode("utf-8", "replace")
@@ -811,6 +884,10 @@ def _finish_result(
         stderr_path=str(stderr_path),
     )
     result["verification"] = _redact_verification(result.get("verification"))
+    # Correspondence runs before the non-completed raise and before the PNG
+    # check, so a forged verification cannot hide behind max_steps, blocked,
+    # or a missing screenshot, and a legitimate row survives a capture failure.
+    _check_verification(op, checks or [], result, protocol_error)
 
     if status != "completed":
         error = obj.get("error")
@@ -820,7 +897,6 @@ def _finish_result(
         raise error_class(status, result["error"], result)
 
     _check_completed(op, obj, result, protocol_error)
-    _check_verification(op, declared_checks, result, protocol_error)
     return result
 
 
@@ -999,7 +1075,7 @@ async def _invoke_runner(
 
                 result = _finish_result(
                     op, stdout, proc.returncode, artifact_dir, profile_dir, stderr_path,
-                    len(checks or []),
+                    checks or [],
                 )
                 # The runner exited and its result parsed, but Chrome or the
                 # harness daemon could still be alive in its group. Nothing may

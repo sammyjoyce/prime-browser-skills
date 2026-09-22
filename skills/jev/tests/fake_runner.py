@@ -81,6 +81,66 @@ def verification_for(req, **overrides):
     return payload
 
 
+def twist_verification(payload, name):
+    """Break a plausible payload in one documented way. Used by protocol tests."""
+    payload = dict(payload)
+    rows = [dict(row) if isinstance(row, dict) else row for row in (payload.get("checks") or [])]
+    payload["checks"] = rows
+    if name == "wrong_id":
+        if rows:
+            nested = dict(rows[0].get("check") or {})
+            nested["id"] = "a-check-the-caller-never-declared"
+            nested["kind"] = "url"
+            nested.pop("selector", None)
+            nested.pop("contains", None)
+            nested["equals"] = "https://example.test/forged"
+            rows[0] = dict(rows[0], id=nested["id"], kind="url", check=nested)
+    elif name == "wrong_kind":
+        if rows:
+            nested = dict(rows[0].get("check") or {})
+            nested["kind"] = "url" if nested.get("kind") != "url" else "title"
+            nested.pop("selector", None)
+            rows[0] = dict(rows[0], kind=nested["kind"], check=nested)
+    elif name == "wrong_spec":
+        if rows:
+            nested = dict(rows[0].get("check") or {})
+            if "equals" in nested:
+                nested["equals"] = "not-what-was-declared"
+            else:
+                nested["contains"] = "not-what-was-declared"
+            rows[0] = dict(rows[0], check=nested)
+    elif name == "missing_spec":
+        if rows:
+            row = dict(rows[0])
+            row.pop("check", None)
+            rows[0] = row
+    elif name == "bool_declared":
+        payload["declared"] = True
+    elif name == "bool_counts":
+        payload["counts"] = {"passed": True, "failed": False, "unknown": False}
+    elif name == "dup_rows":
+        if rows:
+            extra = dict(rows[0])
+            payload["checks"] = [rows[0], extra]
+            payload["declared"] = 2
+            payload["counts"] = {"passed": 2, "failed": 0, "unknown": 0}
+            payload["status"] = "passed"
+    elif name == "wrong_counts":
+        payload["counts"] = {"passed": 99, "failed": 0, "unknown": 0}
+    elif name == "wrong_aggregate":
+        if rows:
+            rows[0] = dict(rows[0], status="failed")
+            payload["status"] = "passed"
+            payload["counts"] = {"passed": 0, "failed": 1, "unknown": 0}
+    elif name == "row_status":
+        if rows:
+            rows[0] = dict(rows[0], status="verified_by_backend")
+    elif name == "bare_row":
+        payload["checks"] = ["not a row" if i == 0 else row for i, row in enumerate(rows)] or ["not a row"]
+        payload["declared"] = len(payload["checks"])
+    return payload
+
+
 def ok_result(req, art, **overrides):
     result = {
         "status": "completed",
@@ -298,6 +358,34 @@ def main():
         payload["checked_at_title"] = "Done " + leak
         emit(ok_result(req, art, verification=payload))
         return
+    if mode.startswith("checks_twist_"):
+        name = mode[len("checks_twist_"):]
+        emit(ok_result(req, art, verification=twist_verification(verification_for(req), name)))
+        return
+    if mode == "checks_blocked":
+        emit({"status": "blocked", "text": "stopped early", "steps": 2, "cost": 0.03,
+              "verification": verification_for(req)})
+        return
+    if mode.startswith("partial_twist_"):
+        # partial_twist_<status>_<name>, e.g. partial_twist_max_steps_wrong_id
+        rest = mode[len("partial_twist_"):]
+        status = name = None
+        for candidate in ("max_steps", "blocked", "timeout", "cost_limit", "error"):
+            prefix = candidate + "_"
+            if rest.startswith(prefix):
+                status, name = candidate, rest[len(prefix):]
+                break
+        if status is None or not name:
+            emit({"status": "error", "error": "unknown partial_twist mode " + mode})
+            return
+        emit({"status": status, "text": "stopped early", "steps": 2, "cost": 0.03,
+              "screenshot_path": write_png(art),
+              "verification": twist_verification(verification_for(req), name)})
+        return
+    if mode == "checks_noshot_corrupt":
+        emit(ok_result(req, art, screenshot_path=None,
+                       verification=twist_verification(verification_for(req), "wrong_id")))
+        return
     if mode == "verified":
         emit(ok_result(req, art, verified=True))
         return
@@ -355,4 +443,5 @@ def main():
     emit(ok_result(req, art))
 
 
-main()
+if __name__ == "__main__":
+    main()

@@ -229,9 +229,12 @@ suites reported 98 Jev runtime checks, 50 Jev wrapper tests, 33 browser-use Node
 have grown since, with exact-value binding and declared DOM checks; the counts measured
 on 2026-09-22 are 273 Jev runtime unit checks, 49 Jev runtime `checks`-group checks
 against real headless Chrome, 75 Jev wrapper tests, 52 Jev vendor tests, and 10
-installer tests. None of them makes a model call. All except the
-`checks` group use fake runners or offline runtime paths; the `checks` group drives real
-headless Chrome against a loopback fixture. None of them establishes live task success.
+installer tests. After the protocol-consistency follow-up on that layer, the remeasured
+counts are 281 Jev runtime unit checks, 49 `checks`-group checks, and 86 Jev wrapper
+tests; vendor and installer trees were not edited. None of them makes a model call.
+All except the `checks` group use fake runners or offline runtime paths; the `checks`
+group drives real headless Chrome against a loopback fixture. None of them establishes
+live task success.
 
 Live validation of the native `jev` package is still in progress. A live navigation task
 passed. A live form task has failed in two different ways, and both failures are kept on

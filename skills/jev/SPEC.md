@@ -31,7 +31,8 @@ Python 3.12 while Prime Agent kernels may use 3.11. Do not install upstream into
   keeps `scope="declared_dom_checks_only"` and per-row `boundary="browser_dom"`, and it
   is a different field from `output["verification"]`, which stays `"not_performed"`.
   A failed or unknown check never changes the run status, and a passing check never
-  claims backend persistence or goal verification.
+  claims backend persistence or goal verification. The wrapper correlates returned
+  rows with the normalized declarations on completed and non-completed results alike.
 - Only an observed mismatch is `failed`. Missing, ambiguous, invisible, refused or
   unreadable evidence is `unknown`; no declared check is `not_run`.
 - Checks are read-only and run once, after execution and before teardown, including

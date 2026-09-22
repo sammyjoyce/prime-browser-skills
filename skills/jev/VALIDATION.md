@@ -112,10 +112,15 @@ change exists. Neither is marked fixed. Deterministic tests do not retire them.
 
 ## Declared DOM checks (deterministic, including real headless Chrome)
 
-Date: 2026-09-22. Scope: the `checks` argument on `jev.run`, the shared contract file
-`src/jev/checks.py`, `runner.verify_declared_checks`, and the new `result["verification"]`
-object. This did not change the agent loop, the vendored fork, the provider path, the
-lifecycle or any existing argument.
+Date: 2026-09-22, remeasured after the protocol-consistency follow-up. Scope: the
+`checks` argument on `jev.run`, the shared contract file `src/jev/checks.py`,
+`runner.verify_declared_checks`, and the new `result["verification"]` object. This did
+not change the agent loop, the vendored fork, the provider path, the lifecycle or any
+existing argument. The 2026-09-22 landing measured 75 wrapper tests and 273 unit
+checks; the follow-up that correlates returned rows with declarations, validates
+non-completed verification objects, and records URL/title truncation remeasured 86
+wrapper tests and 281 unit checks. Historical 2026-09-21 package counts stay in the
+table above.
 
 Unlike exact-value binding, this change has live browser evidence, because a declared
 check is deterministic: it needs a page, not a model. The `checks` group starts its own
@@ -125,11 +130,11 @@ model request and needs no API key.
 
 | Check | Result |
 |---|---|
-| Wrapper suite, `tests/` (72 fake-runner cases plus 3 real-runtime cases) | 75 tests passed |
-| Runtime unit group | 273 checks passed |
+| Wrapper suite, `tests/` (83 methods in `test_jev.py` plus 3 real-runtime cases) | 86 tests passed |
+| Runtime unit group | 281 checks passed |
 | Runtime `checks` group, real headless Chrome and one real runner process | 49 checks passed |
-| Vendor fork tests, `tests/test_agent.py` (unchanged by this work) | 52 tests passed |
-| Installer tests, repository `tests/` | 10 tests passed |
+| Vendor fork tests, `tests/test_agent.py` (unchanged by this follow-up) | 52 tests passed (2026-09-22; vendor tree not edited) |
+| Installer tests, repository `tests/` | 10 tests passed (2026-09-22; installer not edited) |
 
 Commands, exit code 0 for each, run on 2026-09-22 from this checkout:
 
@@ -190,14 +195,22 @@ The second test is the browser one. What it proved, on the local fixture at
 
 Mocked and unmocked contract evidence in the unit group and the wrapper suite:
 
-- Both boundaries reject the same 30 invalid shapes, and the runtime launch test runs
-  the real runtime interpreter to confirm it loaded the wrapper's own `checks.py` and
-  produced byte-identical normalized output and identical rejection messages.
+- Both boundaries reject the same 29 invalid shapes (the `invalid` list in
+  `test_declared_check_contract`, asserted against `normalize_checks` and against
+  `runner.normalize`). The wrapper-only list in
+  `test_checks_must_follow_the_declared_schema` is 30 shapes; it is not the same set.
+  The runtime launch test runs the real runtime interpreter to confirm it loaded the
+  wrapper's own `checks.py` and produced byte-identical normalized output and identical
+  rejection messages.
 - A failed or unknown check leaves the run status `completed`, leaves
   `output["verification"]` at `"not_performed"`, and only adds a warning.
-- A completed result whose verification is missing, short, mis-scoped, mis-bounded,
-  invalid, `not_run` with declared checks, or present with no declared check is a
-  protocol error in the wrapper.
+- A result whose verification is missing, short, mis-scoped, mis-bounded, invalid,
+  `not_run` with declared checks, present with no declared check, whose rows do not
+  match the ordered declarations (id, kind, and the nested `check` snapshot), whose
+  `declared` count is not the integer length, or whose counts/aggregate disagree with
+  the rows is a protocol error in the wrapper. The same correspondence check runs on
+  completed results and on non-completed results (`max_steps`, `blocked`, missing
+  screenshot).
 - Declared-check evidence is redacted for known secret environment values before it
   reaches the caller, and `result.json` carries the same object.
 
@@ -252,9 +265,9 @@ uv run --project runtime --frozen python runtime/tests/run_tests.py --group logi
 ```
 
 `--group all` ran all 146 runtime checks on 2026-09-21, before the unit group grew. The
-unit group is now 273 checks and the new `checks` group is 49. The browser and login
-groups were not re-run on 2026-09-22, so no new all-groups total is claimed. Raw local
-screenshots, browser profiles, provider logs and Prime Agent transcripts are not
+unit group is now 281 checks and the `checks` group is 49. The browser and login
+groups were not re-run after the follow-up, so no new all-groups total is claimed. Raw
+local screenshots, browser profiles, provider logs and Prime Agent transcripts are not
 included in the public repository.
 
 ## Remaining limits

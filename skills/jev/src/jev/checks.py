@@ -37,18 +37,22 @@ __all__ = [
     "CheckError",
     "SCOPE",
     "BOUNDARY",
+    "ROW_STATUSES",
     "STATUSES",
     "KINDS",
     "MAX_CHECKS",
     "normalize_checks",
     "read_expression",
     "summarize",
+    "tally",
+    "same_declaration",
     "verification_payload",
 ]
 
 SCOPE = "declared_dom_checks_only"
 BOUNDARY = "browser_dom"
-STATUSES = ("passed", "failed", "unknown", "not_run")
+ROW_STATUSES = ("passed", "failed", "unknown")
+STATUSES = ROW_STATUSES + ("not_run",)
 NOTE = (
     "browser DOM observation taken after execution, inside the declared scope only; "
     "not evidence that a server stored anything and not a verification of the task goal"
@@ -258,6 +262,30 @@ def summarize(rows: list) -> str:
     return "passed" if statuses == {"passed"} else "unknown"
 
 
+def tally(rows: list) -> dict:
+    """Count passed/failed/unknown rows. Other statuses do not increment a bucket."""
+    counts = {name: 0 for name in ROW_STATUSES}
+    for row in rows:
+        status = row.get("status") if isinstance(row, dict) else None
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def same_declaration(returned: Any, declared: dict) -> bool:
+    """True when a row's `check` object is the caller's normalized declaration.
+
+    Reuses normalize_checks so a fabricated same-id/same-kind object with a
+    different selector, equals or contains cannot pass. Extra keys fail too.
+    """
+    if not isinstance(returned, dict) or not isinstance(declared, dict):
+        return False
+    try:
+        return normalize_checks([returned]) == [declared]
+    except CheckError:
+        return False
+
+
 def _clean_text(value: str, redact: Callable[[str], str] | None, limit: int) -> dict:
     """Reported evidence: redacted first, then bounded, and honest about both."""
     text = redact(value) if redact is not None else value
@@ -266,6 +294,20 @@ def _clean_text(value: str, redact: Callable[[str], str] | None, limit: int) -> 
         observed["truncated"] = True
         observed["length"] = len(text)
     return observed
+
+
+def _capture_text(value: str, redact: Callable[[str], str] | None, limit: int) -> tuple:
+    """A page URL or title: truncated copy plus length/truncated/redacted flags.
+
+    The stored string is never longer than limit. Metadata talks about the
+    redacted text (the value that was considered for storage), not a discarded
+    original, so an overlong raw value is not leaked.
+    """
+    text = redact(value) if redact is not None else value
+    meta = {"length": len(text), "truncated": len(text) > limit}
+    if redact is not None and text != value:
+        meta["redacted"] = True
+    return text[:limit], meta
 
 
 def _unknown(row: dict, reason: str, extra: dict | None = None) -> dict:
@@ -332,6 +374,7 @@ def verification_payload(
     """
     checks = list(checks or [])
     url = title = None
+    url_meta = title_meta = None
     captured_at_ms = None
     consistency = "not_read"
     evidence: list = [None] * len(checks)
@@ -347,9 +390,11 @@ def verification_payload(
             else:
                 captured_at_ms = round(time.time() * 1000)
             if isinstance(payload.get("url"), str):
-                url = _clean_text(payload["url"], redact, MAX_REPORTED_URL_CHARS)["value"]
+                url, url_meta = _capture_text(
+                    payload["url"], redact, MAX_REPORTED_URL_CHARS)
             if isinstance(payload.get("title"), str):
-                title = _clean_text(payload["title"], redact, MAX_REPORTED_CHARS)["value"]
+                title, title_meta = _capture_text(
+                    payload["title"], redact, MAX_REPORTED_CHARS)
 
     rows = []
     for check, item in zip(checks, evidence):
@@ -363,16 +408,18 @@ def verification_payload(
                 "observed": {"available": False, "reason": "evidence_unavailable"},
                 "captured_at_ms": captured_at_ms,
             })
-    counts = {name: sum(1 for row in rows if row["status"] == name)
-              for name in ("passed", "failed", "unknown")}
+    capture_metadata = None
+    if url_meta is not None or title_meta is not None:
+        capture_metadata = {"url": url_meta, "title": title_meta}
     return {
         "status": summarize(rows),
         "scope": SCOPE,
         "boundary": BOUNDARY,
         "declared": len(checks),
-        "counts": counts,
+        "counts": tally(rows),
         "checked_at_url": url,
         "checked_at_title": title,
+        "capture_metadata": capture_metadata,
         "captured_at_ms": captured_at_ms,
         # Every row comes from one synchronous read of one document, so the
         # rows agree with each other and with checked_at_url. They are a

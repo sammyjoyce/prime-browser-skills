@@ -673,6 +673,71 @@ class FailurePathTests(FakeRunnerTestCase):
                 asyncio.run(login(url="https://acme.test/login"))
         self.assertIn("login declares no DOM check", ctx.exception.message)
 
+    FORGED_TWISTS = (
+        ("wrong_id", "must describe declared check"),
+        ("wrong_kind", "must describe declared check"),
+        ("wrong_spec", ".check does not match"),
+        ("missing_spec", ".check is missing"),
+        ("bool_declared", "declared must be the integer"),
+        ("bool_counts", "counts must tally"),
+        ("wrong_counts", "counts must tally"),
+        ("wrong_aggregate", "summarize(rows)"),
+        ("row_status", "passed, failed, unknown"),
+        ("bare_row", "must be an object"),
+    )
+
+    def _declared_text_check(self):
+        return [{"id": "saved", "kind": "text", "selector": "#s", "equals": "Saved"}]
+
+    def test_forged_check_rows_are_protocol_errors(self):
+        declared = self._declared_text_check()
+        for name, fragment in self.FORGED_TWISTS:
+            with self.subTest(twist=name):
+                err = self.assert_status("checks_twist_" + name, "protocol", JevProtocolError,
+                                         checks=declared)
+                self.assertIn(fragment, err.message)
+        two = declared + [{"id": "rows", "kind": "count", "selector": ".r", "equals": 3}]
+        err = self.assert_status("checks_twist_dup_rows", "protocol", JevProtocolError, checks=two)
+        self.assertIn("must describe declared check", err.message)
+
+    def test_forged_partial_verification_is_a_protocol_error(self):
+        declared = self._declared_text_check()
+        for status in ("max_steps", "blocked"):
+            for name, fragment in self.FORGED_TWISTS:
+                with self.subTest(status=status, twist=name):
+                    err = self.assert_status(
+                        "partial_twist_" + status + "_" + name, "protocol", JevProtocolError,
+                        checks=declared)
+                    self.assertIn(fragment, err.message)
+                    self.assertEqual(err.result["status"], status)
+                    self.assertTrue(err.result.get("screenshot_path"))
+
+    def test_a_blocked_stop_keeps_its_check_evidence(self):
+        declared = self._declared_text_check()
+        err = self.assert_status("checks_blocked", "blocked", checks=declared)
+        payload = err.result["verification"]
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(payload["checks"][0]["id"], "saved")
+        self.assertEqual(payload["scope"], jev.CHECK_SCOPE)
+        self.assertEqual(err.result["status"], "blocked")
+
+    def test_a_capture_failure_keeps_legitimate_check_rows(self):
+        declared = self._declared_text_check()
+        err = self.assert_status("noshot", "artifact_error", checks=declared)
+        payload = err.result["verification"]
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(len(payload["checks"]), 1)
+        self.assertEqual(payload["checks"][0]["id"], "saved")
+        self.assertEqual(payload["checks"][0]["kind"], "text")
+        self.assertEqual(payload["scope"], jev.CHECK_SCOPE)
+
+    def test_a_capture_failure_does_not_accept_forged_rows(self):
+        declared = self._declared_text_check()
+        err = self.assert_status("checks_noshot_corrupt", "protocol", JevProtocolError,
+                                 checks=declared)
+        self.assertIn("must describe declared check", err.message)
+        self.assertEqual(err.result["status"], "completed")
+
     def test_completed_without_a_real_png_is_an_artifact_error(self):
         for mode, fragment in {"noshot": "null",
                                "missingshot": "not readable",
@@ -737,6 +802,148 @@ class FailurePathTests(FakeRunnerTestCase):
     def test_lock_is_released_after_a_failure(self):
         self.assert_status("error", "error", profile="reuse")
         self.assertEqual(self.go(profile="reuse")["status"], "completed")
+
+
+class VerificationContractTests(unittest.TestCase):
+    """Direct _finish_result probes: the gate the reviewer called, not the fake runner."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="jev-verif-")).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.art = self.tmp / "art"
+        self.art.mkdir()
+        self.prof = self.tmp / "prof"
+        self.prof.mkdir()
+        self.stderr = self.art / "runner.stderr.log"
+        self.stderr.write_text("")
+        self.png = self.art / "final.png"
+        self.png.write_bytes(jev._PNG_MAGIC + b"\x00" * 16)
+        self.one = jev.normalize_checks(
+            [{"id": "saved", "kind": "text", "selector": "#s", "equals": "Saved"}]
+        )
+        self.two = jev.normalize_checks([
+            {"id": "saved", "kind": "text", "selector": "#s", "equals": "Saved"},
+            {"id": "rows", "kind": "count", "selector": ".r", "equals": 3},
+        ])
+
+    def _png_path(self):
+        return str(self.png)
+
+    def _honest(self, checks, *, failed=False, unknown=False):
+        from jev.checks import verification_payload
+        rows = []
+        for check in checks:
+            if check["kind"] == "count":
+                value = 0 if failed else check["equals"]
+            else:
+                value = "nope" if failed else check.get("equals") or "seen"
+            if unknown:
+                rows.append({"available": False, "reason": "page_unavailable"})
+            else:
+                rows.append({"available": True, "value": value})
+        return verification_payload(checks, {
+            "url": "https://example.test/done", "title": "Done", "at": 1, "rows": rows,
+        })
+
+    def _obj(self, verification, status="completed", **extra):
+        obj = {
+            "status": status,
+            "output": {
+                "final_url": "https://example.test/done",
+                "final_title": "Done",
+                "page_text": "ok",
+                "completion_claimed": True,
+                "verification": "not_performed",
+            },
+            "text": "done",
+            "steps": 1,
+            "cost": 0.01,
+            "screenshot_path": self._png_path(),
+            "verification": verification,
+            "warnings": [],
+        }
+        obj.update(extra)
+        return obj
+
+    def _finish(self, obj, checks):
+        return jev._finish_result(
+            "run", json.dumps(obj).encode(), 0, self.art, self.prof, self.stderr, checks,
+        )
+
+    def _protocol(self, obj, checks, fragment):
+        with self.assertRaises(JevProtocolError) as ctx:
+            self._finish(obj, checks)
+        self.assertIn(fragment, ctx.exception.message)
+        return ctx.exception
+
+    def test_reviewer_forged_completed_payloads_are_rejected(self):
+        import fake_runner
+        cases = FailurePathTests.FORGED_TWISTS + (("dup_rows", "must describe declared check"),)
+        for name, fragment in cases:
+            with self.subTest(twist=name):
+                checks = self.two if name == "dup_rows" else self.one
+                base = self._honest(checks)
+                twisted = fake_runner.twist_verification(base, name)
+                self._protocol(self._obj(twisted), checks, fragment)
+
+    def test_reviewer_forged_partial_payloads_are_rejected(self):
+        import fake_runner
+        for status in ("max_steps", "blocked"):
+            for name, fragment in FailurePathTests.FORGED_TWISTS:
+                with self.subTest(status=status, twist=name):
+                    twisted = fake_runner.twist_verification(self._honest(self.one), name)
+                    err = self._protocol(self._obj(twisted, status=status), self.one, fragment)
+                    self.assertEqual(err.result["status"], status)
+                    self.assertEqual(err.result["screenshot_path"], self._png_path())
+
+    def test_valid_failed_and_unknown_aggregates_are_accepted(self):
+        failed = self._honest(self.one, failed=True)
+        result = self._finish(self._obj(failed), self.one)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["verification"]["status"], "failed")
+        self.assertEqual(result["verification"]["counts"]["failed"], 1)
+        unknown = self._honest(self.one, unknown=True)
+        result = self._finish(self._obj(unknown), self.one)
+        self.assertEqual(result["verification"]["status"], "unknown")
+        self.assertEqual(result["verification"]["counts"]["unknown"], 1)
+        mixed = self._honest(self.two, failed=True)
+        mixed["checks"][1]["status"] = "unknown"
+        mixed["checks"][1]["reason"] = "page_unavailable"
+        mixed["counts"] = {"passed": 0, "failed": 1, "unknown": 1}
+        mixed["status"] = "failed"
+        result = self._finish(self._obj(mixed), self.two)
+        self.assertEqual(result["verification"]["status"], "failed")
+
+    def test_zero_checks_only_allows_not_run_and_empty_rows(self):
+        empty = self._honest([])
+        result = self._finish(self._obj(empty), [])
+        self.assertEqual(result["verification"]["status"], "not_run")
+        self.assertEqual(result["verification"]["checks"], [])
+        none = self._obj(None)
+        result = self._finish(none, [])
+        self.assertIsNone(result["verification"])
+        claimed = dict(empty, status="passed", counts={"passed": 0, "failed": 0, "unknown": 0})
+        self._protocol(self._obj(claimed), [], "not_run")
+        false_declared = dict(empty, declared=False)
+        self._protocol(self._obj(false_declared), [], "declared must be the integer")
+
+    def test_bool_declared_count_is_not_accepted_as_one(self):
+        payload = self._honest(self.one)
+        payload["declared"] = True
+        self._protocol(self._obj(payload), self.one, "declared must be the integer 1")
+
+    def test_missing_nested_check_and_mismatched_declaration(self):
+        payload = self._honest(self.one)
+        payload["checks"][0] = dict(payload["checks"][0])
+        payload["checks"][0].pop("check")
+        self._protocol(self._obj(payload), self.one, ".check is missing")
+        payload = self._honest(self.one)
+        nested = dict(payload["checks"][0]["check"])
+        nested["equals"] = "other"
+        payload["checks"][0] = dict(payload["checks"][0], check=nested)
+        err = self._protocol(self._obj(payload), self.one, ".check does not match")
+        self.assertNotIn("Saved", err.message)
+        self.assertNotIn("other", err.message)
 
 
 class LifecycleTests(FakeRunnerTestCase):

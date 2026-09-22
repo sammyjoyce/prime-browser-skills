@@ -246,6 +246,9 @@ path, exactly as `web-interaction-qa` requires.
   the rows agree with each other and with `checked_at_url`. They are a snapshot of the
   end state, not a per-action assertion: a page that navigates or updates afterwards is
   not covered, and `captured_at_ms` records when the read happened.
+- `checked_at_url` (at most 2048 characters) and `checked_at_title` (at most 2000) stay
+  strings. `capture_metadata` records each field's length and whether it was truncated
+  or redacted. The discarded tail is not stored.
 - They also run after a partial stop (blocked, max_steps, cost limit, timeout,
   cancellation) whenever the browser is still alive, because that is when the page state
   matters most. They are read-only, so this changes nothing about a failed run.
