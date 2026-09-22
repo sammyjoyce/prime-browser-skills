@@ -47,9 +47,21 @@ compile(FAKE_RUNNER_SOURCE, str(FAKE_RUNNER_PATH), "exec")
 REAL_LAUNCH_COMMAND = jev._launch_command
 
 SECRET = "supersecrettoken123"
+# Marker expectation for wrapper-generated unknown-row tests. It must not appear
+# in error text: rows are named by fingerprint, and the declaration is not echoed.
+UNATTEMPTED_EQUALS = "PIN-4242-DO-NOT-ECHO"
 # Every wait in this suite is finite: a hung child fails the test, never the run.
 PID_WAIT_S = 10.0
 DEAD_WAIT_S = 12.0
+
+
+def declared_unattempted_checks():
+    """Two fresh declarations used to prove wrapper-generated unknown rows."""
+    return [
+        {"id": "heading", "kind": "text", "selector": "#status",
+         "equals": UNATTEMPTED_EQUALS},
+        {"id": "rows", "kind": "count", "selector": ".row", "equals": 3},
+    ]
 
 
 def wait_pid_dead(pid, timeout=DEAD_WAIT_S):
@@ -149,6 +161,59 @@ class FakeRunnerTestCase(unittest.TestCase):
 
     def go(self, task="do the thing", url="https://example.test/start", **kwargs):
         return asyncio.run(run(task, url, **kwargs))
+
+    def assert_no_browser_or_model(self, result):
+        """A local wrapper failure never invents a browser session or a model call."""
+        self.assertIsNone(result["model"])
+        self.assertIsNone(result["resolved_model"])
+        self.assertIsNone(result["helper_model"])
+        self.assertIsNone(result["screenshot_path"])
+        self.assertIsNone(result["output"])
+        self.assertEqual(result["text"], "")
+
+    def assert_not_run_verification(self, result):
+        payload = result["verification"]
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["status"], "not_run")
+        self.assertEqual(payload["scope"], jev.CHECK_SCOPE)
+        self.assertEqual(payload["declared"], 0)
+        self.assertEqual(payload["checks"], [])
+        self.assertEqual(payload["counts"], {"passed": 0, "failed": 0, "unknown": 0})
+
+    def assert_unattempted_verification(self, result, declared):
+        """Same scoped unknown rows the runner emits when the read never ran."""
+        payload = result["verification"]
+        normalized = jev.normalize_checks(declared)
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["status"], "unknown")
+        self.assertEqual(payload["scope"], jev.CHECK_SCOPE)
+        self.assertEqual(payload["boundary"], "browser_dom")
+        self.assertEqual(payload["declared"], len(normalized))
+        self.assertEqual(payload["counts"], {
+            "passed": 0, "failed": 0, "unknown": len(normalized),
+        })
+        self.assertEqual(payload["consistency"], "not_read")
+        self.assertIsNone(payload["checked_at_url"])
+        self.assertIsNone(payload["captured_at_ms"])
+        rows = payload["checks"]
+        self.assertEqual(len(rows), len(normalized))
+        blob = json.dumps(payload)
+        self.assertNotIn(UNATTEMPTED_EQUALS, blob)
+        for row, check in zip(rows, normalized):
+            self.assertEqual(row["id"], check["id"])
+            self.assertEqual(row["kind"], check["kind"])
+            self.assertEqual(row["status"], "unknown")
+            self.assertEqual(row["reason"], "verification_not_attempted")
+            self.assertEqual(
+                row["fingerprint"], jev.checks.declaration_fingerprint(check),
+            )
+            self.assertEqual(row["boundary"], jev.CHECK_BOUNDARY)
+            self.assertEqual(
+                row["observed"],
+                {"available": False, "reason": "verification_not_attempted"},
+            )
+            for echoed in ("equals", "contains", "selector", "check"):
+                self.assertNotIn(echoed, row)
 
 
 class ValidationTests(FakeRunnerTestCase):
@@ -834,21 +899,92 @@ class FailurePathTests(FakeRunnerTestCase):
 
     def test_launch_error_when_runtime_runner_is_missing(self):
         missing = self.tmp / "runtime-missing"
+        declared = declared_unattempted_checks()
+        frozen = json.loads(json.dumps(declared))
+        with mock.patch.object(jev, "_launch_command", REAL_LAUNCH_COMMAND), \
+             mock.patch.object(jev, "_runtime_dir", return_value=missing):
+            with self.assertRaises(JevError) as ctx:
+                self.go(checks=declared)
+        err = ctx.exception
+        self.assertEqual(err.status, "launch_error")
+        self.assertIn("uv sync", err.message)
+        self.assertTrue(Path(err.result["artifact_dir"]).is_dir())
+        self.assertNotIn(UNATTEMPTED_EQUALS, err.message)
+        self.assertEqual(declared, frozen)
+        self.assert_unattempted_verification(err.result, frozen)
+        self.assert_no_browser_or_model(err.result)
+
+    def test_launch_error_when_the_interpreter_is_missing(self):
+        declared = declared_unattempted_checks()
+        frozen = json.loads(json.dumps(declared))
+        with mock.patch.object(jev, "_launch_command",
+                               return_value=["/nonexistent/python-bin"]):
+            with self.assertRaises(JevError) as ctx:
+                self.go(checks=declared)
+        err = ctx.exception
+        self.assertEqual(err.status, "launch_error")
+        self.assertNotIn(UNATTEMPTED_EQUALS, err.message)
+        self.assertEqual(declared, frozen)
+        self.assert_unattempted_verification(err.result, frozen)
+        self.assert_no_browser_or_model(err.result)
+
+    def test_launch_error_without_declared_checks_is_not_run(self):
+        missing = self.tmp / "runtime-missing"
         with mock.patch.object(jev, "_launch_command", REAL_LAUNCH_COMMAND), \
              mock.patch.object(jev, "_runtime_dir", return_value=missing):
             with self.assertRaises(JevError) as ctx:
                 self.go()
         err = ctx.exception
         self.assertEqual(err.status, "launch_error")
-        self.assertIn("uv sync", err.message)
-        self.assertTrue(Path(err.result["artifact_dir"]).is_dir())
+        self.assert_not_run_verification(err.result)
+        self.assert_no_browser_or_model(err.result)
 
-    def test_launch_error_when_the_interpreter_is_missing(self):
-        with mock.patch.object(jev, "_launch_command",
-                               return_value=["/nonexistent/python-bin"]):
+    def test_login_launch_error_keeps_verification_none(self):
+        missing = self.tmp / "runtime-missing"
+        with mock.patch.object(jev, "_launch_command", REAL_LAUNCH_COMMAND), \
+             mock.patch.object(jev, "_runtime_dir", return_value=missing):
             with self.assertRaises(JevError) as ctx:
-                self.go()
-        self.assertEqual(ctx.exception.status, "launch_error")
+                asyncio.run(login(url="https://acme.test/login"))
+        err = ctx.exception
+        self.assertEqual(err.status, "launch_error")
+        self.assertIsNone(err.result["verification"])
+        self.assert_no_browser_or_model(err.result)
+
+    def test_protocol_error_on_garbage_stdout_reports_declared_checks(self):
+        declared = declared_unattempted_checks()
+        frozen = json.loads(json.dumps(declared))
+        with env_set(LEAK_TEST_TOKEN=SECRET):
+            err = self.assert_status("garbage", "protocol", JevProtocolError,
+                                     checks=declared)
+        self.assertNotIn(SECRET, err.message)
+        self.assertIn(jev._REDACTED, err.message)
+        self.assertNotIn(UNATTEMPTED_EQUALS, err.message)
+        self.assertEqual(declared, frozen)
+        self.assert_unattempted_verification(err.result, frozen)
+        self.assert_no_browser_or_model(err.result)
+
+    def test_nonzero_exit_with_declared_checks_is_unknown_not_attempted(self):
+        # exit 1 is refused before runner fields are adopted, so the partial
+        # result is the local unknown fallback. The protocol message may still
+        # quote a stdout tail; the structured verification object must not.
+        declared = declared_unattempted_checks()
+        frozen = json.loads(json.dumps(declared))
+        err = self.assert_status("exit1", "protocol", JevProtocolError, checks=declared)
+        self.assertEqual(declared, frozen)
+        self.assert_unattempted_verification(err.result, frozen)
+
+    def test_runner_omitted_verification_is_not_replaced_with_unknown(self):
+        """A parsed runner payload that returned no object stays a protocol error.
+
+        The wrapper must not overwrite that None with synthesized unknown rows:
+        missing verification after a real stdout object is a contract break, not
+        a local pre-read failure.
+        """
+        declared = declared_unattempted_checks()
+        err = self.assert_status("checks_missing", "protocol", JevProtocolError,
+                                 checks=declared)
+        self.assertIn("no verification object", err.message)
+        self.assertIsNone(err.result["verification"])
 
     def test_symlinked_profile_is_refused(self):
         profiles = self.home / "profiles"
@@ -1094,6 +1230,27 @@ class VerificationContractTests(unittest.TestCase):
 
 class LifecycleTests(FakeRunnerTestCase):
     def test_timeout_kills_the_process_group_and_releases_the_lock(self):
+        declared = declared_unattempted_checks()
+        frozen = json.loads(json.dumps(declared))
+        with self.mode("hang"), self.fast_cleanup():
+            async def scenario():
+                with self.assertRaises(JevTimeoutError) as ctx:
+                    await run("t", "https://example.test", timeout_ms=1000, max_steps=1,
+                              checks=declared)
+                return ctx.exception
+
+            err = asyncio.run(scenario())
+        self.assertEqual(err.status, "timeout")
+        self.assertIn("timeout_ms=1000", err.result["error"])
+        self.assertNotIn(UNATTEMPTED_EQUALS, err.message)
+        self.assertNotIn(UNATTEMPTED_EQUALS, err.result["error"])
+        self.assertEqual(declared, frozen)
+        self.assert_unattempted_verification(err.result, frozen)
+        self.assert_no_browser_or_model(err.result)
+        wait_pid_dead(self.wait_pidfile())
+        self.assertEqual(self.go()["status"], "completed")
+
+    def test_timeout_without_declared_checks_is_not_run(self):
         with self.mode("hang"), self.fast_cleanup():
             async def scenario():
                 with self.assertRaises(JevTimeoutError) as ctx:
@@ -1102,21 +1259,35 @@ class LifecycleTests(FakeRunnerTestCase):
 
             err = asyncio.run(scenario())
         self.assertEqual(err.status, "timeout")
-        self.assertIn("timeout_ms=1000", err.result["error"])
+        self.assert_not_run_verification(err.result)
         wait_pid_dead(self.wait_pidfile())
-        self.assertEqual(self.go()["status"], "completed")
+
+    def test_login_timeout_keeps_verification_none(self):
+        with self.mode("hang"), self.fast_cleanup():
+            async def scenario():
+                with self.assertRaises(JevTimeoutError) as ctx:
+                    await login(url="https://acme.test/login", timeout_ms=1000)
+                return ctx.exception
+
+            err = asyncio.run(scenario())
+        self.assertEqual(err.status, "timeout")
+        self.assertIsNone(err.result["verification"])
+        wait_pid_dead(self.wait_pidfile())
 
     def test_cancellation_kills_and_propagates(self):
+        declared = declared_unattempted_checks()
+        frozen = json.loads(json.dumps(declared))
         with self.mode("hang"), self.fast_cleanup():
             async def scenario():
                 task = asyncio.ensure_future(run("t", "https://example.test",
-                                                 timeout_ms=60000))
+                                                 timeout_ms=60000, checks=declared))
                 await self.await_pidfile(task)
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
 
             asyncio.run(scenario())
+        self.assertEqual(declared, frozen)
         wait_pid_dead(self.wait_pidfile())
         self.assertEqual(self.go()["status"], "completed")
 
@@ -1148,6 +1319,18 @@ class LifecycleTests(FakeRunnerTestCase):
                 self.go(timeout_ms=30000)
         wait_pid_dead(self.wait_pidfile("grandchild.pid"))
         self.assertEqual(self.go()["status"], "completed")
+
+    def test_empty_stdout_with_declared_checks_is_unknown_not_attempted(self):
+        declared = declared_unattempted_checks()
+        frozen = json.loads(json.dumps(declared))
+        with self.mode("grandchild"), self.fast_cleanup():
+            with self.assertRaises(JevProtocolError) as ctx:
+                self.go(timeout_ms=30000, checks=declared)
+        err = ctx.exception
+        self.assertNotIn(UNATTEMPTED_EQUALS, err.message)
+        self.assertEqual(declared, frozen)
+        self.assert_unattempted_verification(err.result, frozen)
+        wait_pid_dead(self.wait_pidfile("grandchild.pid"))
 
     def test_success_path_sweeps_leftovers_before_releasing_the_lock(self):
         with self.mode("leftover"):

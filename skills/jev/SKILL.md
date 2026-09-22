@@ -267,7 +267,9 @@ contract's own constants. A result that widens any of them, for example a row cl
   cancellation) whenever the browser is still alive, because that is when the page state
   matters most. They are read-only, so this changes nothing about a failed run.
 - A run that ended before the read could happen reports every declared check as
-  `unknown` with `reason` `verification_not_attempted`.
+  `unknown` with `reason` `verification_not_attempted`. Wrapper-generated launch,
+  protocol, and outer-timeout results do the same, using the same scoped rows
+  the runner would, rather than omitting the object.
 
 ## Screenshots in the main session
 

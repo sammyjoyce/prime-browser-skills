@@ -156,7 +156,15 @@ from typing import Any, NoReturn
 
 from .checks import BOUNDARY as CHECK_BOUNDARY
 from .checks import CONSISTENCY as CHECK_CONSISTENCY
-from .checks import FINGERPRINT_CHARS, CheckError, declaration_fingerprint, normalize_checks, summarize, tally
+from .checks import (
+    FINGERPRINT_CHARS,
+    CheckError,
+    declaration_fingerprint,
+    normalize_checks,
+    summarize,
+    tally,
+    verification_payload,
+)
 from .checks import NOTE as CHECK_NOTE
 from .checks import ROW_STATUSES as CHECK_ROW_STATUSES
 from .checks import SCOPE as CHECK_SCOPE
@@ -675,11 +683,26 @@ def _base_result(status: Any, artifact_dir: Path, profile_dir: Path, stderr_path
         "screenshot_path": None,
         # Structured, caller-declared DOM evidence. Separate from
         # output["verification"], which stays the honesty constant.
+        # Wrapper-generated failures fill this via _verification_before_read;
+        # parsed runner payloads overwrite it. Login keeps None.
         "verification": None,
         "artifact_dir": str(artifact_dir),
         "profile_dir": str(profile_dir),
         "stderr_path": str(stderr_path),
     }
+
+
+def _verification_before_read(op: str, checks: list | None) -> dict | None:
+    """Declared-check evidence when this wrapper never adopted a runner payload.
+
+    Same construction runner.finalize() uses for a run that ended before the
+    read: verification_payload(..., reason="verification_not_attempted").
+    Login does not declare checks and stays None. A run with no declared check
+    is not_run.
+    """
+    if op != "run":
+        return None
+    return verification_payload(list(checks or []), reason="verification_not_attempted")
 
 
 def _is_number(value: Any) -> bool:
@@ -898,10 +921,16 @@ def _finish_result(
     """Parse, type-check and normalize the runner's single stdout JSON object."""
     raw = (stdout or b"").decode("utf-8", "replace")
     result = _base_result("protocol", artifact_dir, profile_dir, stderr_path)
+    adopted = False
 
     def protocol_error(message: str) -> NoReturn:
         message = _redact(message)
         result["error"] = message
+        # Local failure: never parsed a runner verification object. Fill the
+        # same unknown/not_run rows the runner would. After adopt, keep what
+        # the runner actually returned, including a protocol-breaking None.
+        if not adopted:
+            result["verification"] = _verification_before_read(op, checks)
         raise JevProtocolError("protocol", message, result)
 
     try:
@@ -925,6 +954,7 @@ def _finish_result(
 
     # Keep runner extras (metrics, deviations, ...) but own the normalized keys.
     result.update({key: value for key, value in obj.items() if key not in _OWNED_RESULT_KEYS})
+    adopted = True
     status = obj["status"].strip()
     output = obj.get("output")
     cost = obj.get("cost")
@@ -1067,6 +1097,7 @@ async def _invoke_runner(
             message = _redact(message)
             result = _base_result(status, artifact_dir, profile_dir, stderr_path)
             result["error"] = message
+            result["verification"] = _verification_before_read(op, checks)
             raise JevError(status, message, result)
 
         stderr_fh = None
@@ -1125,6 +1156,7 @@ async def _invoke_runner(
                     )
                     result = _base_result("timeout", artifact_dir, profile_dir, stderr_path)
                     result["error"] = message
+                    result["verification"] = _verification_before_read(op, checks)
                     raise JevTimeoutError("timeout", message, result) from None
                 except asyncio.CancelledError:
                     await _terminate_guarded(proc)
