@@ -3,9 +3,11 @@
 Validation date: 2026-09-21. Host: macOS with installed Chrome. Wrapper runtime tested
 on Python 3.11 and 3.13; the separate browser runtime uses Python 3.12.13.
 
-Exact-value binding landed later, on 2026-09-22. Every count below is from the
-2026-09-21 run against the pre-fork tree. The suites have grown since. See
-"Exact-value binding (not live-validated)" for what that change has and has not proven.
+Exact-value binding landed later, on 2026-09-22. Every count in the next table is from
+the 2026-09-21 run against the pre-fork tree. The suites have grown since. See
+"Exact-value binding (not live-validated)" for what that change has and has not proven,
+and "Declared DOM checks" for the later `checks` argument, which does have real
+headless-browser evidence.
 
 ## Package and lifecycle checks
 
@@ -108,6 +110,105 @@ The two earlier form failures stay in the record above. A free-text value that g
 trailing period, and a protocol_error on an invalid helper value, are the reason this
 change exists. Neither is marked fixed. Deterministic tests do not retire them.
 
+## Declared DOM checks (deterministic, including real headless Chrome)
+
+Date: 2026-09-22. Scope: the `checks` argument on `jev.run`, the shared contract file
+`src/jev/checks.py`, `runner.verify_declared_checks`, and the new `result["verification"]`
+object. This did not change the agent loop, the vendored fork, the provider path, the
+lifecycle or any existing argument.
+
+Unlike exact-value binding, this change has live browser evidence, because a declared
+check is deterministic: it needs a page, not a model. The `checks` group starts its own
+headless Chrome with its own profile and its own browser-harness daemon, serves a local
+fixture page, and runs the same `verify_declared_checks` the runner calls. It makes no
+model request and needs no API key.
+
+| Check | Result |
+|---|---|
+| Wrapper suite, `tests/` (72 fake-runner cases plus 3 real-runtime cases) | 75 tests passed |
+| Runtime unit group | 273 checks passed |
+| Runtime `checks` group, real headless Chrome and one real runner process | 49 checks passed |
+| Vendor fork tests, `tests/test_agent.py` (unchanged by this work) | 52 tests passed |
+| Installer tests, repository `tests/` | 10 tests passed |
+
+Commands, exit code 0 for each, run on 2026-09-22 from this checkout:
+
+```sh
+cd skills/jev
+uv run python -m unittest discover -s tests -v
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group unit
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+cd runtime/vendor/jev-ultrafast && uv run pytest -q
+cd ../../../../.. && python3 -m unittest discover -s tests -v
+```
+
+Lint, with the vendor's own ruff and its 120-character line length, over every file this
+change touched:
+
+```sh
+cd skills/jev/runtime/vendor/jev-ultrafast
+uv run ruff check --isolated --line-length 120 --select E,F,I   ../../../src/jev/checks.py ../../../src/jev/__init__.py ../../../runtime/runner.py   ../../../runtime/tests/run_tests.py ../../../runtime/tests/fixture_server.py   ../../../tests/test_jev.py ../../../tests/fake_runner.py   ../../../tests/test_runtime_launch.py
+```
+
+It reports 25 findings and exits 1. The same command over the same files taken from the
+commit this branch starts at reports the same 25 findings, in the same files under the
+same rules: pre-existing long lines and the deliberate mid-file imports in
+`runtime/tests/run_tests.py`, plus one unused import in the repository's own
+`tests/test_install.py`. `src/jev/checks.py` reports nothing. This change adds no new
+finding; it also does not clean up the old ones.
+
+The `checks` group runs two tests. The first starts the real runner process with
+declared checks and no `OPENROUTER_API_KEY`: the run stops before Chrome starts, and the
+result plus `result.json` report both declared checks as `unknown` with reason
+`verification_not_attempted`, never as passed and never dropped. A second request in the
+same test carries an unsupported check kind and comes back `invalid_request` from the
+runner itself, which is the re-validation the wrapper does not get to skip.
+
+The second test is the browser one. What it proved, on the local fixture at
+`runtime/tests/fixture_server.py`:
+
+- Every kind against a real page: exact and substring `url` and `title`, `text` on a
+  visible element, `value` on an input, a textarea, a select and a contenteditable
+  element, and `count` on 0, 2 and 3 matches.
+- A mismatch is `failed` for each kind that can fail.
+- Unknown, never failed, for: a selector matching two elements, a selector matching
+  none, a `display:none` element, a password input (both `value` and `text`), a
+  `type=hidden` input, a file input, an element that holds no value, and two invalid
+  selectors.
+- The password and hidden-field values in the fixture never appear in any observed
+  evidence. They appear in the result only where the test itself declared them as
+  expectations, which is the caller's own input.
+- The read changes nothing: a document-level capture listener for click, input, change,
+  submit, keydown and pointerdown counted zero events, and the field value and element
+  count were unchanged afterwards.
+- One read per call: every row carries the same `captured_at_ms`, and
+  `checked_at_url`/`checked_at_title` describe the document that was read.
+- After a navigation, a second call reports the new URL and different outcomes, which is
+  why the checks are documented as an end-state snapshot rather than a per-action
+  assertion.
+- After the page was closed, every row is `unknown` and nothing raised.
+
+Mocked and unmocked contract evidence in the unit group and the wrapper suite:
+
+- Both boundaries reject the same 30 invalid shapes, and the runtime launch test runs
+  the real runtime interpreter to confirm it loaded the wrapper's own `checks.py` and
+  produced byte-identical normalized output and identical rejection messages.
+- A failed or unknown check leaves the run status `completed`, leaves
+  `output["verification"]` at `"not_performed"`, and only adds a warning.
+- A completed result whose verification is missing, short, mis-scoped, mis-bounded,
+  invalid, `not_run` with declared checks, or present with no declared check is a
+  protocol error in the wrapper.
+- Declared-check evidence is redacted for known secret environment values before it
+  reaches the caller, and `result.json` carries the same object.
+
+Not established by any of this:
+
+- No live model run has used `checks` yet. The binding of a model-driven form fill to a
+  declared check has not been exercised end to end.
+- A passing check is DOM evidence at one instant. It is not proof of backend
+  persistence, and the two earlier live form failures below are not affected by it.
+- The group ran on macOS only, against a loopback fixture, in headless Chrome.
+
 ## Re-run deterministic checks
 
 From the installed Jev skill directory:
@@ -118,8 +219,29 @@ uv run python -m unittest discover -s tests -v
 uv run --project runtime --frozen python runtime/tests/run_tests.py --group unit
 ```
 
-These commands require no model key and make no paid model calls. The two real-runtime
-wrapper tests skip if runtime setup has not been completed.
+These commands require no model key and make no paid model calls. The three
+real-runtime wrapper tests skip if runtime setup has not been completed.
+
+`uv sync --project runtime --frozen` installs the vendored `jev-ultrafast` package
+non-editably from `runtime/vendor/jev-ultrafast`. Nothing in the declared-check work
+touches that package, so no reinstall is needed for it. If you do change a vendored
+file, force the copy in the runtime environment to be rebuilt:
+
+```sh
+uv sync --project runtime --frozen --reinstall-package jev-ultrafast
+```
+
+The wrapper package is installed editably from `src/`, so `src/jev/checks.py` is picked
+up without a reinstall. The runner loads that same file by path, so an installed copy
+must always contain both `src/` and `runtime/`; `install.py` copies them together and a
+test in the repository's `tests/test_install.py` checks that.
+
+The declared-check group starts its own headless Chrome and its own browser-harness
+daemon on a temporary profile. It opens no window and makes no model call:
+
+```sh
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+```
 
 The following additional groups open real Chrome windows and use a loopback fixture.
 They make no model calls. Run them only on a host where opening Chrome is appropriate:
@@ -129,16 +251,20 @@ uv run --project runtime --frozen python runtime/tests/run_tests.py --group brow
 uv run --project runtime --frozen python runtime/tests/run_tests.py --group login
 ```
 
-`--group all` ran all 146 runtime checks on 2026-09-21. The unit group is now 148
-checks. The browser and login groups were not re-run on 2026-09-22, so no new all-groups
-total is claimed. Raw local screenshots, browser profiles, provider logs and Prime Agent
-transcripts are not included in the public repository.
+`--group all` ran all 146 runtime checks on 2026-09-21, before the unit group grew. The
+unit group is now 273 checks and the new `checks` group is 49. The browser and login
+groups were not re-run on 2026-09-22, so no new all-groups total is claimed. Raw local
+screenshots, browser profiles, provider logs and Prime Agent transcripts are not
+included in the public repository.
 
 ## Remaining limits
 
 - Exact field fidelity is not guaranteed by a model completion claim. Supplied values
   are copied byte for byte once bound, but no live run has yet checked a bound value,
   a cleared field or a skipped field against server state.
+- A declared DOM check is browser evidence inside the scope the caller declared. It is
+  not a verified goal, not a backend readback, and a `completed` status still means the
+  executor claimed completion. The two form failures above are not retired by it.
 - No production accounts, native mobile devices, uploads, complex iframe or shadow-DOM
   flows, or broad real-site reliability test was performed.
 - Model costs are soft limits, checked between calls. Unknown usage stops execution.

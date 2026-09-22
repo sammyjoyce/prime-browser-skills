@@ -42,6 +42,8 @@ There is no silent model/provider fallback or automatic task replay.
 Jev selects code-owned actions from the observed DOM. You can supply the exact field
 values; its text helper writes a value only when you allow it to. Jev does not accept an
 output schema and does not generate a free-form answer to an extraction question.
+`checks=` returns evidence for the assertions you declare yourself; it is not an
+extraction API and cannot answer an open question about the page.
 
 ## Run one complete task
 
@@ -71,14 +73,18 @@ attempt stopped on an invalid helper value. Neither failure is automatically ret
 treated as success.
 
 A successful result has `status="completed"`, `output`, `text`, `steps`, `cost`,
-`usage`, `screenshot_path`, `artifact_dir`, `profile_dir`, model identifiers, warnings,
-and timing data. Paths are absolute. `output` contains the final URL, title, page text,
-`completion_claimed`, and `verification="not_performed"`.
+`usage`, `screenshot_path`, `verification`, `artifact_dir`, `profile_dir`, model
+identifiers, warnings, and timing data. Paths are absolute. `output` contains the final
+URL, title, page text, `completion_claimed`, and `verification="not_performed"`.
+`result["verification"]` is a different field: the scoped DOM evidence described in
+"Declared DOM checks" below, and `"not_run"` unless you declare checks.
 
 **Completed does not mean independently verified.** It means Jev chose DONE, the
 screenshot was saved and cleanup succeeded. Check the actual postcondition before
 reporting task success. For writes, verify the saved state, not just a success toast.
 The built-in QA skills define evidence requirements when the task is a QA check.
+`checks=` adds declared DOM evidence to the result, but that is page evidence inside
+the scope you declared, not a verified goal and not proof of backend persistence.
 
 Every non-completed result raises `jev.JevError`. Keep the real message and partial
 result instead of reducing it to a generic failure:
@@ -151,6 +157,100 @@ actions, and to the call that binds a value to a field, and to the text helper w
 `generation="helper"` runs. All of it leaves the host through OpenRouter and its selected
 providers. Never put a password, token, card number or any other credential or private
 data in `values`. Sign in with `jev.login` instead.
+
+## Declared DOM checks
+
+`checks` asks for read-only evidence from the page the browser ends on. It changes
+nothing else: the run's status, `output["completion_claimed"]` and
+`output["verification"]` stay exactly as they were.
+
+```python
+result = await jev.run(
+    "Open the feedback form, fill it from the supplied values, then submit it.",
+    url="https://your-approved-app.example/feedback",
+    profile="work",
+    values={"reviewer_name": "Ada Lovelace"},
+    checks=[
+        {"id": "landed", "kind": "url", "contains": "/feedback/thanks"},
+        {"id": "banner", "kind": "text", "selector": "#status", "equals": "Thank you"},
+        {"id": "name_kept", "kind": "value", "selector": "#reviewer_name",
+         "equals": "Ada Lovelace"},
+        {"id": "errors", "kind": "count", "selector": ".field-error", "equals": 0},
+    ],
+)
+print(result["verification"]["status"])          # passed | failed | unknown | not_run
+for row in result["verification"]["checks"]:
+    print(row["id"], row["status"], row["reason"], row["observed"])
+```
+
+Each check is an object with an `id`, a `kind`, a `selector` for the kinds that need
+one, and exactly one of `equals` or `contains`:
+
+| kind | reads | selector | expectation |
+|---|---|---|---|
+| `url` | `location.href` | not allowed | `equals` or `contains` |
+| `title` | `document.title` | not allowed | `equals` or `contains` |
+| `text` | `innerText` of one visible element | required | `equals` or `contains` |
+| `value` | value of one input, textarea, select or contenteditable | required | `equals` or `contains` |
+| `count` | number of matching elements | required | `equals`, a whole number |
+
+`id` defaults to `check[<index>]` and must be unique. At most 20 checks; ids at most
+100 characters, selectors 1000, expectations 2000, counts 0 to 100000. An unknown key,
+a missing or duplicate id, a bool or non-finite count, a selector on `url`/`title`,
+both or neither of `equals`/`contains`, or an empty `contains` raises
+`jev.JevValidationError` before any process starts. The runtime validates the same
+request again with the same contract file, `src/jev/checks.py`.
+
+`equals` compares byte for byte, `contains` is a case-sensitive substring, and nothing
+is trimmed or normalised. There is no `attribute` kind, no regular expression, no
+model call, and no arbitrary JavaScript: only the kind and the selector are sent into
+the page, and every comparison happens in the runtime process afterwards, so a page
+cannot see what you are asserting.
+
+### What a status means
+
+- `passed`: every declared check matched.
+- `failed`: at least one check observed a value that did not match. Only an observed
+  mismatch is a failure.
+- `unknown`: evidence was missing, ambiguous, invisible, refused or unreadable. A
+  selector that matches zero or several elements is `unknown`, not `failed`, with
+  `reason` `missing_or_ambiguous` and `observed["matches"]`. So is a page the reader
+  could not reach at all, with `reason` `page_unavailable`.
+- `not_run`: you declared no check. That is not a pass.
+
+**A check is not a verification of your goal, and `completed` still means the executor
+claimed completion.** Nothing in this result promotes one to the other: a failed or
+unknown check leaves the status `completed` and only adds a warning, and a passing
+check leaves `output["verification"]` at `"not_performed"`.
+
+**DOM evidence is not backend persistence.** `scope` is always
+`declared_dom_checks_only` and every row carries `boundary: "browser_dom"`. A green
+banner and a filled field prove what the page showed at one instant, not that a server
+stored anything. For writes, still read the saved state back through an independent
+path, exactly as `web-interaction-qa` requires.
+
+### Evidence sensitivity and timing
+
+- `count` counts every match, so a selector that is not unique inflates or deflates the
+  number. Count what you mean: `.row` counts rows, `.field-error` counts errors.
+- `text` reads `innerText` of one visible element, which follows the browser's rendered
+  whitespace and excludes hidden text. An `equals` on a whole paragraph is brittle;
+  `contains` on a stable phrase is usually the honest check.
+- `value` reads the live field. The observed value is returned in the result and
+  written to `result.json`, redacted for known secret environment values and truncated
+  at 2000 characters. A password input is refused and never returns a value, and so are
+  `type=hidden` and file inputs. There is no generic hidden-field extraction.
+- Your own expectation is echoed in `verification.checks[].check`, so do not put a
+  secret in `equals` or `contains` either.
+- The checks run once, after execution and before teardown, in one synchronous read, so
+  the rows agree with each other and with `checked_at_url`. They are a snapshot of the
+  end state, not a per-action assertion: a page that navigates or updates afterwards is
+  not covered, and `captured_at_ms` records when the read happened.
+- They also run after a partial stop (blocked, max_steps, cost limit, timeout,
+  cancellation) whenever the browser is still alive, because that is when the page state
+  matters most. They are read-only, so this changes nothing about a failed run.
+- A run that ended before the read could happen reports every declared check as
+  `unknown` with `reason` `verification_not_attempted`.
 
 ## Screenshots in the main session
 
@@ -236,6 +336,12 @@ screenshot with `attach_image`.
 ## Validation
 
 From this skill directory, run the deterministic tests documented in `VALIDATION.md`.
+The declared-check group runs against real headless Chrome and makes no model call:
+
+```sh
+uv run --project runtime --frozen python runtime/tests/run_tests.py --group checks
+```
+
 That file records commands, evidence and any remaining gaps; it must not label planned
 tests as passed. From a fresh Prime Agent session in another directory, verify native
 `jev` discovery, run an approved local task, check its independent outcome, and view its

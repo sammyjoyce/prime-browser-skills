@@ -2,8 +2,9 @@
 
 Usage:
     uv run --frozen python tests/run_tests.py            # unit group
-    uv run --frozen python tests/run_tests.py --group browser
-    uv run --frozen python tests/run_tests.py --group login
+    uv run --frozen python tests/run_tests.py --group checks   # headless Chrome
+    uv run --frozen python tests/run_tests.py --group browser  # opens Chrome
+    uv run --frozen python tests/run_tests.py --group login    # opens Chrome
 """
 
 import base64
@@ -529,9 +530,15 @@ def test_reported_actions_and_deviations(runner):
     check("deviations.fork_names_binding", "byte for byte" in fork[0], fork[0] if fork else "")
     check("deviations.fork_names_null_helper", "skips the field" in fork[0], fork[0] if fork else "")
     check("deviations.fork_points_at_provenance", "vendor/PROVENANCE.md" in fork[0])
-    check("deviations.count_is_five", len(runner.DEVIATIONS) == 5, str(len(runner.DEVIATIONS)))
-    check("deviations.docstring_counts_them", "five differences" in runner.__doc__)
+    check("deviations.count_is_six", len(runner.DEVIATIONS) == 6, str(len(runner.DEVIATIONS)))
+    check("deviations.docstring_counts_them", "six differences" in runner.__doc__)
     check("deviations.docstring_drops_never_edited", "never edited" not in runner.__doc__)
+    verification = [d for d in runner.DEVIATIONS if d.startswith("verification:")]
+    check("deviations.one_verification_entry", len(verification) == 1, str(len(verification)))
+    check("deviations.verification_is_read_only",
+          "read-only" in verification[0] and "never written to" in verification[0]
+          and "declared_dom_checks_only" in verification[0],
+          verification[0] if verification else "")
 
 
 def test_bind_call_is_costed_like_a_decision(runner):
@@ -597,6 +604,383 @@ def test_bind_call_is_costed_like_a_decision(runner):
     os.environ.pop("TYPESAFE_MODEL", None)
 
 
+# --------------------------------------------------------------------------
+# declared DOM checks: contract, evidence mapping and wiring. No browser here;
+# the headless `checks` group below runs the same code against real Chrome.
+# --------------------------------------------------------------------------
+SECRET_EXPECTATION = "Zurich-order-9f2a-Kn0wn"
+
+
+class FakeBrowser:
+    """Only what verification is allowed to use: one read-only evaluate()."""
+
+    def __init__(self, payload=None, error=None):
+        self.payload = payload
+        self.error = error
+        self.expressions = []
+
+    def evaluate(self, expression):
+        self.expressions.append(expression)
+        if self.error is not None:
+            raise self.error
+        return self.payload
+
+
+def good_checks():
+    return [
+        {"id": "url", "kind": "url", "equals": "https://app.test/done"},
+        {"id": "title", "kind": "title", "contains": "Done"},
+        {"id": "heading", "kind": "text", "selector": "h1", "equals": "Saved"},
+        {"id": "email", "kind": "value", "selector": "#email", "equals": "dana@example.test"},
+        {"id": "rows", "kind": "count", "selector": ".row", "equals": 3},
+    ]
+
+
+def evidence(*rows, url="https://app.test/done", title="Done", at=1737000000000):
+    return {"url": url, "title": title, "at": at, "rows": list(rows)}
+
+
+def test_declared_check_contract(runner):
+    contract = runner.dom_checks
+    skill_root = Path(runner.__file__).resolve().parent.parent
+    check(
+        "checks.contract_is_the_wrapper_file",
+        Path(contract.__file__).resolve() == (skill_root / "src" / "jev" / "checks.py"),
+        contract.__file__,
+    )
+
+    normalized = contract.normalize_checks(good_checks())
+    check("checks.every_kind_normalizes", [row["kind"] for row in normalized]
+          == ["url", "title", "text", "value", "count"])
+    check("checks.selector_is_none_for_page_kinds",
+          normalized[0]["selector"] is None and normalized[2]["selector"] == "h1")
+    check("checks.normalize_is_idempotent", contract.normalize_checks(normalized) == normalized)
+    check("checks.none_and_empty_mean_no_checks",
+          contract.normalize_checks(None) == [] and contract.normalize_checks([]) == [])
+    check("checks.id_defaults_to_position",
+          contract.normalize_checks([{"kind": "url", "equals": "x"}])[0]["id"] == "check[0]")
+    source = [{"id": "a", "kind": "url", "equals": "x"}]
+    snapshot = contract.normalize_checks(source)
+    source[0]["equals"] = "mutated"
+    check("checks.snapshot_survives_caller_mutation", snapshot[0]["equals"] == "x")
+
+    invalid = [
+        ("not_a_list", {"id": "a", "kind": "url", "equals": "x"}),
+        ("too_many", [{"kind": "url", "equals": "x"}] * (contract.MAX_CHECKS + 1)),
+        ("item_not_object", ["h1"]),
+        ("unknown_key", [{"id": "a", "kind": "url", "equals": "x", "script": "1"}]),
+        ("malicious_key", [{"id": "a", "kind": "url", "equals": "x", "__proto__": {"kind": "url"}}]),
+        ("prototype_key", [{"id": "a", "kind": "url", "equals": "x", "constructor": "x"}]),
+        ("blank_id", [{"id": "  ", "kind": "url", "equals": "x"}]),
+        ("non_string_id", [{"id": 7, "kind": "url", "equals": "x"}]),
+        ("long_id", [{"id": "i" * 101, "kind": "url", "equals": "x"}]),
+        ("duplicate_id", [{"id": "a", "kind": "url", "equals": "x"},
+                          {"id": "a", "kind": "title", "equals": "y"}]),
+        ("duplicate_default_id", [{"kind": "url", "equals": "x"},
+                                  {"id": "check[0]", "kind": "title", "equals": "y"}]),
+        ("unknown_kind", [{"id": "a", "kind": "attribute", "selector": "a", "equals": "x"}]),
+        ("missing_kind", [{"id": "a", "equals": "x"}]),
+        ("selector_on_url", [{"id": "a", "kind": "url", "selector": "h1", "equals": "x"}]),
+        ("missing_selector", [{"id": "a", "kind": "text", "equals": "x"}]),
+        ("blank_selector", [{"id": "a", "kind": "text", "selector": " ", "equals": "x"}]),
+        ("long_selector", [{"id": "a", "kind": "text", "selector": "d" * 1001, "equals": "x"}]),
+        ("both_expectations", [{"id": "a", "kind": "url", "equals": "x", "contains": "x"}]),
+        ("no_expectation", [{"id": "a", "kind": "url"}]),
+        ("empty_contains", [{"id": "a", "kind": "url", "contains": ""}]),
+        ("non_string_expectation", [{"id": "a", "kind": "url", "equals": 3}]),
+        ("long_expectation", [{"id": "a", "kind": "url", "equals": "x" * 2001}]),
+        ("count_contains", [{"id": "a", "kind": "count", "selector": ".r", "contains": "3"}]),
+        ("count_bool", [{"id": "a", "kind": "count", "selector": ".r", "equals": True}]),
+        ("count_float", [{"id": "a", "kind": "count", "selector": ".r", "equals": 3.0}]),
+        ("count_infinite", [{"id": "a", "kind": "count", "selector": ".r", "equals": float("inf")}]),
+        ("count_nan", [{"id": "a", "kind": "count", "selector": ".r", "equals": float("nan")}]),
+        ("count_negative", [{"id": "a", "kind": "count", "selector": ".r", "equals": -1}]),
+        ("count_string", [{"id": "a", "kind": "count", "selector": ".r", "equals": "3"}]),
+    ]
+    for name, payload in invalid:
+        expect_raises(
+            "checks.reject." + name, contract.CheckError,
+            lambda payload=payload: contract.normalize_checks(payload),
+        )
+        # Boundary parity: the runner rejects exactly what the contract rejects.
+        expect_raises(
+            "checks.runner_rejects." + name, runner.RequestError,
+            lambda payload=payload: runner.normalize({
+                "op": "run", "task": "t", "url": "http://127.0.0.1:1/",
+                "profile_dir": "/tmp/jev-test-profile", "artifact_dir": "/tmp/jev-test-artifacts",
+                "checks": payload,
+            }),
+        )
+
+    # Messages carry indexes, types and lengths; never an expectation.
+    leaks = []
+    for payload in ([{"id": "a", "kind": "url", "equals": SECRET_EXPECTATION * 100}],
+                    [{"id": "a", "kind": "text", "selector": SECRET_EXPECTATION, "equals": 1}],
+                    [{"id": "a", "kind": "url", "contains": ""}]):
+        try:
+            contract.normalize_checks(payload)
+        except contract.CheckError as exc:
+            if SECRET_EXPECTATION in str(exc):
+                leaks.append(str(exc))
+    check("checks.errors_never_quote_the_expectation", not leaks, str(leaks))
+
+    base = {"op": "run", "task": "t", "url": "http://127.0.0.1:1/",
+            "profile_dir": "/tmp/jev-test-profile", "artifact_dir": "/tmp/jev-test-artifacts"}
+    check("checks.request_without_checks_is_unchanged", runner.normalize(dict(base))["checks"] == [])
+    check("checks.request_with_null_checks", runner.normalize({**base, "checks": None})["checks"] == [])
+    check("checks.login_declares_nothing",
+          runner.normalize({"op": "login", "url": "http://127.0.0.1:1/",
+                            "profile_dir": "/tmp/jev-test-profile",
+                            "artifact_dir": "/tmp/jev-test-artifacts"})["checks"] == [])
+    check("checks.runner_normalizes_like_the_contract",
+          runner.normalize({**base, "checks": good_checks()})["checks"] == normalized)
+
+
+def test_declared_check_expression(runner):
+    contract = runner.dom_checks
+    checks = contract.normalize_checks([
+        {"id": "zz_identifier", "kind": "text", "selector": "h1", "equals": "Saved"},
+        {"id": "zz_secret", "kind": "value", "selector": "#code", "equals": SECRET_EXPECTATION},
+    ])
+    expression = contract.read_expression(checks)
+    check("checks.expression_sends_no_expectation", SECRET_EXPECTATION not in expression)
+    check("checks.expression_sends_no_ids", "zz_identifier" not in expression
+          and "zz_secret" not in expression)
+    check("checks.expression_carries_selectors", '"#code"' in expression and '"h1"' in expression)
+    writes = [token for token in
+              ("dispatchEvent", "innerHTML", "outerHTML", ".click(", ".submit(",
+               "location.assign", "location.replace", "setAttribute", "removeAttribute",
+               "appendChild", "eval(", "Function(", "fetch(", "XMLHttpRequest")
+              if token in expression]
+    check("checks.expression_is_read_only", not writes, str(writes))
+    check("checks.expression_escapes_non_ascii",
+          contract.read_expression(contract.normalize_checks(
+              [{"id": "u", "kind": "text", "selector": ".x\u2028y", "equals": "a"}])).isascii())
+    check("checks.expression_refuses_password_and_hidden",
+          "sensitive_field" in expression and "hidden_field" in expression)
+
+
+def test_declared_check_evidence(runner):
+    contract = runner.dom_checks
+    checks = contract.normalize_checks(good_checks())
+
+    passing = evidence(
+        {"available": True, "value": "https://app.test/done"},
+        {"available": True, "value": "Order Done"},
+        {"available": True, "value": "Saved"},
+        {"available": True, "value": "dana@example.test"},
+        {"available": True, "value": 3},
+    )
+    payload = contract.verification_payload(checks, passing)
+    check("checks.all_pass", payload["status"] == "passed", json.dumps(payload["counts"]))
+    check("checks.scope_is_declared_only", payload["scope"] == "declared_dom_checks_only")
+    check("checks.boundary_is_the_dom", payload["boundary"] == "browser_dom"
+          and all(row["boundary"] == "browser_dom" for row in payload["checks"]))
+    check("checks.snapshot_records_url_and_time",
+          payload["checked_at_url"] == "https://app.test/done"
+          and payload["captured_at_ms"] == 1737000000000
+          and payload["consistency"] == "single_synchronous_read")
+    check("checks.note_is_not_persistence_proof",
+          "not evidence that a server stored anything" in payload["note"])
+    check("checks.rows_keep_their_ids",
+          [row["id"] for row in payload["checks"]] == ["url", "title", "heading", "email", "rows"])
+    check("checks.declared_count", payload["declared"] == 5
+          and payload["counts"] == {"passed": 5, "failed": 0, "unknown": 0})
+
+    mixed = contract.verification_payload(checks, evidence(
+        {"available": True, "value": "https://app.test/other"},              # failed
+        {"available": True, "value": "Done"},                                # passed
+        {"available": False, "reason": "missing_or_ambiguous", "matches": 2},  # unknown
+        {"available": False, "reason": "sensitive_field"},                   # unknown
+        {"available": True, "value": 4},                                     # failed
+    ))
+    check("checks.mixed_is_failed", mixed["status"] == "failed")
+    check("checks.mixed_counts", mixed["counts"] == {"passed": 1, "failed": 2, "unknown": 2},
+          json.dumps(mixed["counts"]))
+    check("checks.mismatch_is_failed", mixed["checks"][0]["status"] == "failed")
+    check("checks.ambiguous_is_unknown_not_failed",
+          mixed["checks"][2]["status"] == "unknown"
+          and mixed["checks"][2]["reason"] == "missing_or_ambiguous"
+          and mixed["checks"][2]["observed"]["matches"] == 2)
+    check("checks.password_is_unknown_and_valueless",
+          mixed["checks"][3]["status"] == "unknown"
+          and mixed["checks"][3]["reason"] == "sensitive_field"
+          and "value" not in mixed["checks"][3]["observed"])
+
+    unknown_only = contract.verification_payload(checks[:2], evidence(
+        {"available": False, "reason": "unreadable_or_invalid_selector"},
+        {"available": False, "reason": "not_visible"},
+    ))
+    check("checks.unknown_only_is_unknown", unknown_only["status"] == "unknown")
+    check("checks.invalid_selector_reason",
+          unknown_only["checks"][0]["reason"] == "unreadable_or_invalid_selector")
+
+    for reason in ("hidden_field", "not_a_field", "unsupported_control", "value_too_large"):
+        row = contract.verification_payload(checks[3:4], evidence(
+            {"available": False, "reason": reason, "length": 99999}))["checks"][0]
+        check("checks.reason." + reason, row["status"] == "unknown" and row["reason"] == reason)
+
+    invented = contract.verification_payload(checks[:1], evidence(
+        {"available": False, "reason": "because I said so"}))["checks"][0]
+    check("checks.unknown_reason_is_normalized", invented["reason"] == "evidence_unavailable")
+
+    wrong_type = contract.verification_payload(checks[4:5], evidence(
+        {"available": True, "value": "3"}))["checks"][0]
+    check("checks.count_needs_a_number", wrong_type["status"] == "unknown"
+          and wrong_type["reason"] == "evidence_type_mismatch")
+    bool_count = contract.verification_payload(
+        contract.normalize_checks([{"id": "c", "kind": "count", "selector": ".r", "equals": 1}]),
+        evidence({"available": True, "value": True}))["checks"][0]
+    check("checks.true_is_not_a_count_of_one", bool_count["status"] == "unknown")
+
+    text_type = contract.verification_payload(checks[2:3], evidence(
+        {"available": True, "value": 5}))["checks"][0]
+    check("checks.text_needs_a_string", text_type["status"] == "unknown"
+          and text_type["reason"] == "evidence_type_mismatch")
+
+    contains = contract.normalize_checks(
+        [{"id": "c", "kind": "text", "selector": "p", "contains": "order 12"}])
+    hit = contract.verification_payload(contains, evidence(
+        {"available": True, "value": "We saved order 1234 for you"}))
+    miss = contract.verification_payload(contains, evidence(
+        {"available": True, "value": "We saved Order 1234 for you"}))
+    check("checks.contains_matches_substring", hit["status"] == "passed")
+    check("checks.contains_is_case_sensitive", miss["status"] == "failed")
+
+    exact = contract.normalize_checks(
+        [{"id": "v", "kind": "value", "selector": "#n", "equals": " Ada  Lovelace "}])
+    check("checks.equals_is_byte_for_byte",
+          contract.verification_payload(exact, evidence(
+              {"available": True, "value": "Ada Lovelace"}))["status"] == "failed")
+    check("checks.equals_accepts_an_empty_expectation",
+          contract.verification_payload(
+              contract.normalize_checks([{"id": "v", "kind": "value", "selector": "#n",
+                                          "equals": ""}]),
+              evidence({"available": True, "value": ""}))["status"] == "passed")
+
+    long_value = "x" * (contract.MAX_REPORTED_CHARS + 500)
+    bounded = contract.verification_payload(
+        contract.normalize_checks([{"id": "t", "kind": "text", "selector": "p",
+                                    "contains": "xxx"}]),
+        evidence({"available": True, "value": long_value}))["checks"][0]
+    check("checks.observed_value_is_bounded",
+          len(bounded["observed"]["value"]) == contract.MAX_REPORTED_CHARS
+          and bounded["observed"]["truncated"] is True
+          and bounded["observed"]["length"] == len(long_value)
+          and bounded["status"] == "passed")
+
+    redacted = contract.verification_payload(
+        contract.normalize_checks([{"id": "t", "kind": "text", "selector": "p",
+                                    "contains": "token"}]),
+        evidence({"available": True, "value": "token " + SECRET_EXPECTATION},
+                 url="https://app.test/?t=" + SECRET_EXPECTATION),
+        redact=lambda text: text.replace(SECRET_EXPECTATION, "[REDACTED]"))
+    check("checks.evidence_is_redacted_after_comparison",
+          redacted["status"] == "passed"
+          and SECRET_EXPECTATION not in json.dumps(redacted))
+
+    check("checks.no_checks_is_not_run",
+          contract.verification_payload([])["status"] == "not_run"
+          and contract.verification_payload([])["declared"] == 0
+          and contract.verification_payload([])["checks"] == [])
+    check("checks.not_run_records_no_read",
+          contract.verification_payload([])["consistency"] == "not_read"
+          and contract.verification_payload([])["captured_at_ms"] is None)
+
+    unreadable = contract.verification_payload(checks, None, reason="page_unavailable")
+    check("checks.unreadable_page_is_all_unknown",
+          unreadable["status"] == "unknown"
+          and len(unreadable["checks"]) == 5
+          and {row["reason"] for row in unreadable["checks"]} == {"page_unavailable"})
+    short = contract.verification_payload(checks, evidence({"available": True, "value": "x"}))
+    check("checks.row_count_mismatch_is_unknown",
+          short["status"] == "unknown" and len(short["checks"]) == 5
+          and short["consistency"] == "not_read")
+    junk = contract.verification_payload(checks[:2], evidence("nope", None))
+    check("checks.junk_rows_are_unknown", junk["status"] == "unknown"
+          and len(junk["checks"]) == 2)
+
+
+def test_declared_check_wiring(runner):
+    contract = runner.dom_checks
+    checks = contract.normalize_checks(good_checks()[:3])
+
+    browser = FakeBrowser(payload=evidence(
+        {"available": True, "value": "https://app.test/done"},
+        {"available": True, "value": "Done"},
+        {"available": True, "value": "Saved"},
+    ))
+    payload = runner.verify_declared_checks(browser, checks)
+    check("wiring.one_read_per_run", len(browser.expressions) == 1)
+    check("wiring.passes_through", payload["status"] == "passed")
+    check("wiring.no_checks_makes_no_read",
+          runner.verify_declared_checks(FakeBrowser(), [])["status"] == "not_run")
+
+    for name, error in (("stale_page", ValueError("Document changed during evaluation")),
+                        ("detached", RuntimeError("Session with given id not found.")),
+                        ("secret_message", RuntimeError("boom " + SECRET_EXPECTATION))):
+        broken = runner.verify_declared_checks(FakeBrowser(error=error), checks)
+        check("wiring.error." + name,
+              broken["status"] == "unknown"
+              and {row["reason"] for row in broken["checks"]} == {"page_unavailable"}
+              and SECRET_EXPECTATION not in json.dumps(broken))
+
+    check("wiring.junk_payload_is_unknown",
+          runner.verify_declared_checks(FakeBrowser(payload="not a dict"), checks)["status"]
+          == "unknown")
+
+    result = {"warnings": [], "verification": contract.verification_payload(checks, evidence(
+        {"available": True, "value": "https://app.test/other"},
+        {"available": True, "value": "Done"},
+        {"available": False, "reason": "not_visible"},
+    ))}
+    runner.note_verification(result)
+    check("wiring.failure_is_warned_not_promoted",
+          len(result["warnings"]) == 1 and "1 failed" in result["warnings"][0]
+          and "executor claim" in result["warnings"][0])
+    quiet = {"warnings": [], "verification": contract.verification_payload([])}
+    runner.note_verification(quiet)
+    check("wiring.not_run_is_not_warned", quiet["warnings"] == [])
+
+    workspace = Path(tempfile.mkdtemp(prefix="jev-checks-"))
+    try:
+        shot = workspace / "final.png"
+        shot.write_bytes(PNG_1X1)
+        # A failed or unknown check never changes the run's own status: a
+        # completed run stays an executor claim, and nothing is promoted.
+        statuses = []
+        for status in ("passed", "failed", "unknown", "not_run"):
+            outcome = {"output": {"completion_claimed": True, "verification": "not_performed"},
+                       "screenshot_path": str(shot), "verification": {"status": status}}
+            statuses.append(runner.decide_status("run", "done", None, outcome, True))
+        check("wiring.status_ignores_check_outcomes", set(statuses) == {runner.COMPLETED},
+              str(statuses))
+
+        runner.HTTP_ATTEMPTS.clear()
+        runner.LOGICAL_CALLS.clear()
+        result = {"op": "run", "warnings": [], "verification": None}
+        runner.finalize(result, {"op": "run", "checks": checks, "artifact_dir": workspace})
+        check("wiring.unattempted_checks_are_unknown",
+              result["verification"]["status"] == "unknown"
+              and result["verification"]["declared"] == 3
+              and {row["reason"] for row in result["verification"]["checks"]}
+              == {"verification_not_attempted"})
+        saved = json.loads((workspace / "result.json").read_text())
+        check("wiring.verification_reaches_result_json",
+              saved["verification"]["scope"] == "declared_dom_checks_only"
+              and len(saved["verification"]["checks"]) == 3)
+        result = {"op": "run", "warnings": [], "verification": None}
+        runner.finalize(result, {"op": "run", "checks": [], "artifact_dir": workspace})
+        check("wiring.no_checks_finalizes_as_not_run",
+              result["verification"]["status"] == "not_run")
+        check("wiring.base_result_always_has_the_key",
+              "verification" in runner.base_result(
+                  {"op": "run", "artifact_dir": workspace, "profile_dir": workspace,
+                   "profile": "p"}))
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 UNIT_TESTS = [
     test_group_scan_excludes_itself,
     test_supplied_values,
@@ -611,6 +995,10 @@ UNIT_TESTS = [
     test_provider_errors,
     test_daemon_patch_fails_closed,
     test_status_decisions,
+    test_declared_check_contract,
+    test_declared_check_expression,
+    test_declared_check_evidence,
+    test_declared_check_wiring,
 ]
 
 
@@ -1072,6 +1460,291 @@ def test_clean_login_reports_clean_cleanup(_runner):
         workspace.cleanup()
 
 
+# --------------------------------------------------------------------------
+# checks group: declared DOM checks against real headless Chrome. No model
+# call, no API key, no headed window, and nothing but the local fixture.
+# --------------------------------------------------------------------------
+PASSWORD_IN_FIXTURE = "fixture-password-never-read"
+HIDDEN_IN_FIXTURE = "fixture-hidden-csrf-value"
+
+CHECK_CASES = [
+    # (id, check, expected status, expected reason)
+    ("url_exact", {"kind": "url", "equals": "{base}checks"}, "passed", None),
+    ("url_contains", {"kind": "url", "contains": "/checks"}, "passed", None),
+    ("url_wrong", {"kind": "url", "equals": "https://example.test/"}, "failed", None),
+    ("title_exact", {"kind": "title", "equals": "Jev checks fixture"}, "passed", None),
+    ("title_contains", {"kind": "title", "contains": "checks"}, "passed", None),
+    ("title_wrong", {"kind": "title", "contains": "Checkout"}, "failed", None),
+    ("text_exact", {"kind": "text", "selector": "#heading", "equals": "Saved"}, "passed", None),
+    ("text_contains", {"kind": "text", "selector": "#summary", "contains": "Order 4471"},
+     "passed", None),
+    ("text_wrong", {"kind": "text", "selector": "#heading", "equals": "saved"}, "failed", None),
+    ("text_invisible", {"kind": "text", "selector": "#invisible", "equals": "Invisible text"},
+     "unknown", "not_visible"),
+    ("text_ambiguous", {"kind": "text", "selector": ".ambiguous", "equals": "first"},
+     "unknown", "missing_or_ambiguous"),
+    ("text_missing", {"kind": "text", "selector": "#nowhere", "equals": "x"},
+     "unknown", "missing_or_ambiguous"),
+    ("text_bad_selector", {"kind": "text", "selector": "h1[", "equals": "x"},
+     "unknown", "unreadable_or_invalid_selector"),
+    ("value_input", {"kind": "value", "selector": "#email", "equals": "dana@example.test"},
+     "passed", None),
+    ("value_textarea", {"kind": "value", "selector": "#note", "contains": "note line"},
+     "passed", None),
+    ("value_select", {"kind": "value", "selector": "#choice", "equals": "beta"}, "passed", None),
+    ("value_editable", {"kind": "value", "selector": "#editable", "equals": "Editable text"},
+     "passed", None),
+    ("value_wrong", {"kind": "value", "selector": "#email", "equals": "someone@example.test"},
+     "failed", None),
+    ("value_password", {"kind": "value", "selector": "#secret", "equals": PASSWORD_IN_FIXTURE},
+     "unknown", "sensitive_field"),
+    ("text_password", {"kind": "text", "selector": "#secret", "contains": "fixture"},
+     "unknown", "sensitive_field"),
+    ("value_hidden", {"kind": "value", "selector": "#token", "equals": HIDDEN_IN_FIXTURE},
+     "unknown", "hidden_field"),
+    ("value_file", {"kind": "value", "selector": "#upload", "equals": ""},
+     "unknown", "unsupported_control"),
+    ("value_not_a_field", {"kind": "value", "selector": "#heading", "equals": "Saved"},
+     "unknown", "not_a_field"),
+    ("count_exact", {"kind": "count", "selector": ".row", "equals": 3}, "passed", None),
+    ("count_wrong", {"kind": "count", "selector": ".row", "equals": 2}, "failed", None),
+    ("count_zero", {"kind": "count", "selector": ".nothing-here", "equals": 0}, "passed", None),
+    ("count_many", {"kind": "count", "selector": ".ambiguous", "equals": 2}, "passed", None),
+    ("count_bad_selector", {"kind": "count", "selector": "*::", "equals": 1},
+     "unknown", "unreadable_or_invalid_selector"),
+]
+
+
+def checks_environment(work, name, runtime_dir):
+    """Private browser-harness identity for one headless Chrome.
+
+    No provider key and no TYPESAFE/TEXT_MODEL variable is set: this group
+    never reaches a model. runtime_dir is short and under /tmp for the same
+    reason runner.run_operation uses one: the harness IPC socket lives there
+    and an AF_UNIX path is limited to about 100 characters. Returns the
+    previous values so the caller restores the test process's own environment.
+    """
+    wanted = {
+        "BU_NAME": name,
+        "BH_HOME": str(work / "harness"),
+        "BH_RUNTIME_DIR": str(runtime_dir),
+        "BH_TMP_DIR": str(work / "harness-tmp"),
+        "BH_AGENT_WORKSPACE": str(work / "harness-workspace"),
+        "BH_TELEMETRY": "0",
+        "BROWSER_HARNESS_TELEMETRY": "0",
+        "ANONYMIZED_TELEMETRY": "false",
+        "DO_NOT_TRACK": "1",
+    }
+    previous = {key: os.environ.get(key) for key in
+                list(wanted) + ["BU_CDP_URL", "BU_CDP_WS", "BU_BROWSER_ID"]}
+    for key in ("BU_CDP_URL", "BU_CDP_WS", "BU_BROWSER_ID"):
+        os.environ.pop(key, None)
+    os.environ.update(wanted)
+    return previous
+
+
+def restore_environment(previous):
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def wait_for_ready(browser, timeout_s=10.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            if browser.evaluate("document.readyState") == "complete":
+                return True
+        except Exception:
+            pass
+        time.sleep(0.05)
+    return False
+
+
+def test_declared_checks_against_headless_chrome(runner):
+    """The real thing: one headless Chrome, the local fixture, no model call."""
+    contract = runner.dom_checks
+    work = Path(tempfile.mkdtemp(prefix="jev-checks-browser-")).resolve()
+    harness_runtime = Path(tempfile.mkdtemp(prefix="jv", dir="/tmp"))
+    server, thread, base_url, _state = fixture_server.start()
+    owned = runner.OwnedProcesses()
+    previous = checks_environment(work, "jev-checks-" + work.name[-8:], harness_runtime)
+    browser = None
+    try:
+        try:
+            runner.chrome_binary()
+        except Exception as exc:
+            check("browser_checks.chrome_available", False, "%s: %s" % (type(exc).__name__, exc))
+            return
+        profile_dir = work / "profile"
+        artifact_dir = work / "artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        port = runner.launch_chrome(profile_dir, artifact_dir, headless=True, owned=owned)
+        os.environ["BU_CDP_URL"] = "http://127.0.0.1:%d" % port
+        runner.start_private_daemon(owned, artifact_dir, os.environ["BU_NAME"])
+
+        from jev_ultrafast.browser import Browser
+
+        page_url = base_url + "checks"
+        browser = Browser(page_url)
+        check("browser_checks.page_loaded", wait_for_ready(browser))
+
+        declared = []
+        for name, body, _status, _reason in CHECK_CASES:
+            item = {"id": name}
+            for key, value in body.items():
+                if key in ("equals", "contains") and isinstance(value, str):
+                    value = value.replace("{base}", base_url)
+                item[key] = value
+            declared.append(item)
+        # More cases than one call may declare, so they run in bounded batches.
+        rows = {}
+        batches = []
+        for start in range(0, len(declared), contract.MAX_CHECKS):
+            batch_checks = contract.normalize_checks(declared[start:start + contract.MAX_CHECKS])
+            batches.append((batch_checks, runner.verify_declared_checks(browser, batch_checks)))
+            rows.update({row["id"]: row for row in batches[-1][1]["checks"]})
+        checks, payload = batches[0]
+
+        check("browser_checks.one_row_per_check", len(rows) == len(CHECK_CASES))
+        for name, _body, status, reason in CHECK_CASES:
+            row = rows.get(name, {})
+            check("browser_checks.%s.%s" % (name, status),
+                  row.get("status") == status and (reason is None or row.get("reason") == reason),
+                  "status=%r reason=%r" % (row.get("status"), row.get("reason")))
+        check("browser_checks.summary_is_failed",
+              all(batch["status"] == "failed" for _checks, batch in batches),
+              json.dumps([batch["counts"] for _checks, batch in batches]))
+        check("browser_checks.snapshot_url", payload["checked_at_url"] == page_url,
+              str(payload["checked_at_url"]))
+        check("browser_checks.snapshot_title", payload["checked_at_title"] == "Jev checks fixture")
+        check("browser_checks.snapshot_is_one_read",
+              payload["consistency"] == "single_synchronous_read"
+              and isinstance(payload["captured_at_ms"], int)
+              and all(row["captured_at_ms"] == payload["captured_at_ms"]
+                      for row in payload["checks"]))
+        check("browser_checks.scope_is_declared_only",
+              payload["scope"] == "declared_dom_checks_only"
+              and payload["declared"] == len(payload["checks"]))
+
+        # The page holds both strings. They may appear in the result only
+        # because these two cases declared them as expectations; no observed
+        # evidence ever carries them back.
+        observed = json.dumps([row["observed"] for _checks, batch in batches
+                               for row in batch["checks"]])
+        check("browser_checks.password_never_leaves_the_page",
+              PASSWORD_IN_FIXTURE not in observed
+              and "value" not in rows["value_password"]["observed"]
+              and "value" not in rows["text_password"]["observed"])
+        check("browser_checks.hidden_field_never_leaves_the_page",
+              HIDDEN_IN_FIXTURE not in observed
+              and "value" not in rows["value_hidden"]["observed"])
+        check("browser_checks.observed_values_are_reported",
+              rows["value_input"]["observed"]["value"] == "dana@example.test"
+              and rows["count_exact"]["observed"]["value"] == 3)
+
+        # Read-only in a real browser: no event fired and the DOM is unchanged.
+        check("browser_checks.no_event_was_dispatched",
+              browser.evaluate("window.__fixtureEvents") == 0)
+        check("browser_checks.dom_is_unchanged",
+              browser.evaluate("document.getElementById('email').value") == "dana@example.test"
+              and browser.evaluate("document.querySelectorAll('.row').length") == 3)
+
+        # The snapshot follows the document: checks are not atomic across a
+        # navigation, and the payload says which URL it read.
+        browser.call("Page.navigate", url=base_url + "checks?second=1")
+        check("browser_checks.second_page_loaded", wait_for_ready(browser))
+        after = runner.verify_declared_checks(browser, checks)
+        check("browser_checks.navigation_moves_the_snapshot",
+              after["checked_at_url"] == base_url + "checks?second=1"
+              and {row["id"] for row in after["checks"] if row["status"] == "failed"}
+              != {row["id"] for row in payload["checks"] if row["status"] == "failed"},
+              str(after["checked_at_url"]))
+
+        # A torn-down page reports unknown, never failed, and never raises.
+        closed, browser = browser, None
+        closed.close()
+        gone = runner.verify_declared_checks(closed, checks)
+        reasons = {row["reason"] for row in gone["checks"]}
+        check("browser_checks.torn_down_page_is_unknown",
+              gone["status"] == "unknown" and len(gone["checks"]) == len(checks)
+              and reasons <= {"page_unavailable", "evidence_unavailable"},
+              "%s %s" % (gone["status"], sorted(reasons)))
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        # Direct handles only: no process-group sweep from inside the test
+        # process, which does not own this process group.
+        owned.stop_daemon()
+        owned.stop_chrome()
+        fixture_server.stop(server, thread)
+        restore_environment(previous)
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(harness_runtime, ignore_errors=True)
+
+
+def test_declared_checks_through_a_real_runner_process(runner):
+    """End to end through the runner process: no key, no browser, no model.
+
+    Without OPENROUTER_API_KEY the run stops before Chrome starts, which is
+    exactly the case where a declared check must be reported as unknown rather
+    than silently dropped. The second request proves the runner re-validates
+    the contract itself, in its own process, after the wrapper already has.
+    """
+    work = Path(tempfile.mkdtemp(prefix="jev-checks-runner-")).resolve()
+    try:
+        env = os.environ.copy()
+        for name in ("OPENROUTER_API_KEY", "TYPESAFE_API_KEY", "TEXT_MODEL_API_KEY"):
+            env.pop(name, None)
+        check("runner_process.no_key_is_set", not env.get("OPENROUTER_API_KEY"))
+        artifacts = work / "artifacts"
+        declared = [{"id": "landed", "kind": "url", "contains": "/done"},
+                    {"id": "rows", "kind": "count", "selector": ".row", "equals": 3}]
+        request = {
+            "op": "run", "task": "do the thing", "url": "http://127.0.0.1:9/",
+            "profile_dir": str(work / "profile"), "artifact_dir": str(artifacts),
+            "max_steps": 1, "timeout_ms": 30000, "max_cost_usd": 0.01, "checks": declared,
+        }
+        payload, out, err = finish_runner(start_runner(request, env=env), timeout_s=120)
+        check("runner_process.credentials_error",
+              isinstance(payload, dict) and payload.get("status") == "credentials_error",
+              str(payload)[:200] + err[-200:])
+        verification = (payload or {}).get("verification") or {}
+        check("runner_process.declared_checks_are_unknown",
+              verification.get("status") == "unknown"
+              and verification.get("declared") == 2
+              and verification.get("scope") == "declared_dom_checks_only"
+              and [row["reason"] for row in verification.get("checks", [])]
+              == ["verification_not_attempted"] * 2,
+              json.dumps(verification)[:300])
+        check("runner_process.no_browser_started", not (artifacts / "chrome.log").exists())
+        saved = json.loads((artifacts / "result.json").read_text())
+        check("runner_process.result_json_carries_the_evidence",
+              saved["verification"]["declared"] == 2
+              and len(saved["verification"]["checks"]) == 2)
+
+        rejected = dict(request, artifact_dir=str(work / "artifacts-2"),
+                        checks=[{"kind": "attribute", "selector": "a", "equals": "x"}])
+        payload, _out, err = finish_runner(start_runner(rejected, env=env), timeout_s=120)
+        check("runner_process.invalid_check_is_invalid_request",
+              isinstance(payload, dict) and payload.get("status") == "invalid_request"
+              and "checks[0].kind" in (payload.get("error") or ""),
+              str(payload)[:200] + err[-200:])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+CHECKS_TESTS = [
+    test_declared_checks_through_a_real_runner_process,
+    test_declared_checks_against_headless_chrome,
+]
+
+
 BROWSER_TESTS = [
     test_launch_guard,
     test_clean_login_reports_clean_cleanup,
@@ -1091,8 +1764,9 @@ def main():
     print("compiled runner and test modules")
     import runner as runner_module
 
-    groups = {"unit": UNIT_TESTS, "browser": BROWSER_TESTS, "login": LOGIN_TESTS}
-    groups["all"] = UNIT_TESTS + BROWSER_TESTS + LOGIN_TESTS
+    groups = {"unit": UNIT_TESTS, "checks": CHECKS_TESTS,
+              "browser": BROWSER_TESTS, "login": LOGIN_TESTS}
+    groups["all"] = UNIT_TESTS + CHECKS_TESTS + BROWSER_TESTS + LOGIN_TESTS
     selected = groups.get(group)
     if selected is None:
         print("unknown group %r" % group)

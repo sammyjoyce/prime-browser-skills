@@ -10,6 +10,7 @@ without uv, Chrome, a provider key, or any paid model call.
 """
 
 import asyncio
+import json
 import os
 import shutil
 import stat
@@ -277,6 +278,67 @@ class ValidationTests(FakeRunnerTestCase):
             with self.subTest(generation=bad):
                 self._assert_invalid(lambda: run("t", "https://example.test", generation=bad))
 
+    def test_checks_must_follow_the_declared_schema(self):
+        bad = [
+            {"id": "a", "kind": "url", "equals": "x"},              # an object, not a list
+            "url", 5, True, ["h1"], [None],
+            [{"kind": "url"}],                                      # no expectation
+            [{"kind": "url", "equals": "x", "contains": "x"}],      # both expectations
+            [{"kind": "url", "contains": ""}],                      # matches every page
+            [{"kind": "url", "equals": 3}],                         # type coercion
+            [{"kind": "url", "equals": "x" * (jev.checks.MAX_EXPECTED_CHARS + 1)}],
+            [{"kind": "attribute", "selector": "a", "equals": "x"}],  # unsupported kind
+            [{"kind": "text", "equals": "x"}],                      # selector required
+            [{"kind": "text", "selector": "  ", "equals": "x"}],
+            [{"kind": "text", "selector": "d" * (jev.checks.MAX_SELECTOR_CHARS + 1),
+              "equals": "x"}],
+            [{"kind": "url", "selector": "h1", "equals": "x"}],     # no selector allowed
+            [{"kind": "count", "selector": ".r", "equals": True}],  # a bool is not a count
+            [{"kind": "count", "selector": ".r", "equals": 3.0}],
+            [{"kind": "count", "selector": ".r", "equals": float("inf")}],
+            [{"kind": "count", "selector": ".r", "equals": float("nan")}],
+            [{"kind": "count", "selector": ".r", "equals": -1}],
+            [{"kind": "count", "selector": ".r", "contains": "3"}],
+            [{"kind": "url", "equals": "x", "script": "alert(1)"}],   # unknown key
+            [{"kind": "url", "equals": "x", "__proto__": {"kind": "url"}}],
+            [{"kind": "url", "equals": "x", "constructor": "boom"}],
+            [{"id": 7, "kind": "url", "equals": "x"}],
+            [{"id": "  ", "kind": "url", "equals": "x"}],
+            [{"id": "i" * (jev.checks.MAX_ID_CHARS + 1), "kind": "url", "equals": "x"}],
+            [{"id": "a", "kind": "url", "equals": "x"},
+             {"id": "a", "kind": "title", "equals": "y"}],          # duplicate id
+            [{"kind": "url", "equals": "x"}] * (jev.checks.MAX_CHECKS + 1),
+        ]
+        for checks in bad:
+            with self.subTest(checks=repr(checks)[:60]):
+                self._assert_invalid(lambda: run("t", "https://example.test", checks=checks))
+
+    def test_check_limits_at_the_boundary_are_accepted(self):
+        checks = [{"id": "i" * jev.checks.MAX_ID_CHARS, "kind": "url",
+                   "equals": "x" * jev.checks.MAX_EXPECTED_CHARS},
+                  {"kind": "count", "selector": "d" * jev.checks.MAX_SELECTOR_CHARS,
+                   "equals": 0}]
+        checks += [{"id": "pad%d" % i, "kind": "title", "contains": "x"}
+                   for i in range(jev.checks.MAX_CHECKS - len(checks))]
+        request = self.go(checks=checks)["output"]["request"]
+        self.assertEqual(len(request["checks"]), jev.checks.MAX_CHECKS)
+
+    def test_an_invalid_check_never_echoes_the_expectation(self):
+        error = self._assert_invalid(
+            lambda: run("t", "https://example.test",
+                        checks=[{"id": "pin", "kind": "count", "selector": "#p",
+                                 "equals": "123456-" + SECRET}])
+        )
+        self.assertNotIn(SECRET, error.message)
+        self.assertNotIn("123456", error.message)
+        self.assertIn("checks[0]", error.message)
+
+    def test_no_run_starts_for_invalid_checks(self):
+        with self.assertRaises(JevValidationError):
+            asyncio.run(run("t", "https://example.test", checks=[{"kind": "nope"}]))
+        self.assertFalse((self.home / "artifacts").exists())
+        self.assertFalse((self.home / "profiles").exists())
+
     def test_no_run_starts_for_invalid_input(self):
         with self.assertRaises(JevValidationError):
             asyncio.run(run("t", "nope"))
@@ -359,6 +421,64 @@ class SuccessPathTests(FakeRunnerTestCase):
         )
         self.assertNotIn("text", result["actions"][0])
         self.assertNotIn("dana@example.test", result["text"])
+
+    def test_declared_checks_reach_the_request_normalized(self):
+        request = self.go(checks=[
+            {"kind": "text", "selector": "#status", "equals": "Saved"},
+            {"id": "rows", "kind": "count", "selector": ".row", "equals": 3},
+        ])["output"]["request"]
+        self.assertEqual(request["checks"], [
+            {"id": "check[0]", "kind": "text", "selector": "#status", "equals": "Saved"},
+            {"id": "rows", "kind": "count", "selector": ".row", "equals": 3},
+        ])
+
+    def test_declared_checks_return_a_scoped_verification_object(self):
+        result = self.go(checks=[{"id": "done", "kind": "url",
+                                  "equals": "https://example.test/done"}])
+        payload = result["verification"]
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(payload["scope"], jev.CHECK_SCOPE)
+        self.assertEqual(payload["scope"], "declared_dom_checks_only")
+        self.assertEqual(payload["boundary"], "browser_dom")
+        self.assertEqual(len(payload["checks"]), 1)
+        self.assertEqual(payload["checks"][0]["id"], "done")
+        # The structured object never changes the two honesty fields.
+        self.assertEqual(result["output"]["verification"], "not_performed")
+        self.assertTrue(result["output"]["completion_claimed"])
+        self.assertEqual(result["status"], "completed")
+
+    def test_no_declared_check_is_not_run_and_changes_nothing(self):
+        result = self.go()
+        self.assertEqual(result["verification"]["status"], "not_run")
+        self.assertEqual(result["verification"]["checks"], [])
+        self.assertEqual(result["output"]["request"]["checks"], [])
+        self.assertEqual(result["status"], "completed")
+
+    def test_failed_or_unknown_checks_never_change_the_status(self):
+        for mode, status in (("checks_failed", "failed"), ("checks_unknown", "unknown")):
+            with self.subTest(mode=mode), self.mode(mode):
+                result = self.go(checks=[{"id": "saved", "kind": "text",
+                                          "selector": "#s", "equals": "Saved"}])
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["verification"]["status"], status)
+                self.assertEqual(result["verification"]["checks"][0]["status"], status)
+                self.assertEqual(result["output"]["verification"], "not_performed")
+                self.assertTrue(result["output"]["completion_claimed"])
+
+    def test_check_evidence_is_redacted(self):
+        with env_set(LEAK_TEST_TOKEN=SECRET), self.mode("checks_leak"):
+            result = self.go(checks=[{"id": "t", "kind": "text",
+                                      "selector": "#s", "equals": "page said x"}])
+        payload = result["verification"]
+        self.assertNotIn(SECRET, json.dumps(payload))
+        self.assertIn(jev._REDACTED, payload["checks"][0]["observed"]["value"])
+        self.assertIn(jev._REDACTED, payload["checked_at_url"])
+
+    def test_login_declares_no_check(self):
+        with self.mode("login_ok"):
+            result = asyncio.run(login(url="https://acme.test/login"))
+        self.assertIsNone(result["verification"])
+        self.assertNotIn("checks", result["output"]["request"])
 
     def test_screenshot_is_an_existing_absolute_png(self):
         result = self.go()
@@ -515,6 +635,43 @@ class FailurePathTests(FakeRunnerTestCase):
         err = self.assert_status("verified", "protocol", JevProtocolError)
         self.assertTrue(err.result.get("verified"),
                         "contradictory evidence must stay in the partial result")
+
+    def test_broken_verification_contracts_are_protocol_errors(self):
+        declared = [{"id": "saved", "kind": "text", "selector": "#s", "equals": "Saved"}]
+        cases = {
+            "checks_missing": "no verification object",
+            "checks_short": "one row per declared check",
+            "checks_scope": "verification.scope",
+            "checks_boundary": "verification.boundary",
+            "checks_status": "verification.status",
+            "checks_notrun": "not_run",
+            "checks_not_an_object": "verification must be an object",
+        }
+        for mode, fragment in cases.items():
+            with self.subTest(mode=mode):
+                err = self.assert_status(mode, "protocol", JevProtocolError, checks=declared)
+                self.assertIn(fragment, err.message)
+
+    def test_a_partial_stop_keeps_its_check_evidence(self):
+        declared = [{"id": "saved", "kind": "text", "selector": "#s", "equals": "Saved"}]
+        err = self.assert_status("checks_partial", "max_steps", checks=declared)
+        payload = err.result["verification"]
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(len(payload["checks"]), 1)
+        self.assertEqual(payload["checks"][0]["id"], "saved")
+        self.assertEqual(payload["scope"], jev.CHECK_SCOPE)
+
+    def test_verification_without_a_declared_check_is_a_protocol_error(self):
+        invented = self.assert_status("checks_invented", "protocol", JevProtocolError)
+        self.assertIn("one row per declared check", invented.message)
+        claimed = self.assert_status("checks_extra", "protocol", JevProtocolError)
+        self.assertIn("no declared check", claimed.message)
+
+    def test_login_must_not_claim_verification(self):
+        with self.mode("login_verification"):
+            with self.assertRaises(JevProtocolError) as ctx:
+                asyncio.run(login(url="https://acme.test/login"))
+        self.assertIn("login declares no DOM check", ctx.exception.message)
 
     def test_completed_without_a_real_png_is_an_artifact_error(self):
         for mode, fragment in {"noshot": "null",

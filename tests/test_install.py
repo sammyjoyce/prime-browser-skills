@@ -105,6 +105,26 @@ class InstallBehaviour(TempDestTestCase):
         installed = sorted(p.name for p in self.dest.iterdir())
         self.assertEqual(installed, install.available())
 
+    def test_jev_ships_its_shared_check_contract_with_the_runtime(self):
+        """The runner loads src/jev/checks.py by path, so both must be copied.
+
+        jev validates declared DOM checks in the wrapper and again in the
+        runtime, using one file. An install that carried only one of them
+        would fail at the first run with an import error, not a typed error.
+        """
+        code, text = call("--dest", str(self.dest), "--only", "jev")
+        self.assertEqual(code, 0, text)
+        skill = self.dest / "jev"
+        contract = skill / "src" / "jev" / "checks.py"
+        runner = skill / "runtime" / "runner.py"
+        self.assertTrue(contract.is_file(), "src/jev/checks.py was not installed")
+        self.assertTrue(runner.is_file(), "runtime/runner.py was not installed")
+        self.assertEqual(contract.read_bytes(),
+                         (install.SOURCE / "jev" / "src" / "jev" / "checks.py").read_bytes())
+        # The path runner.py computes for the contract, resolved in the copy.
+        self.assertTrue((runner.parent.parent / "src" / "jev" / "checks.py").is_file())
+        self.assertIn('"src" / "jev" / "checks.py"', runner.read_text())
+
     def test_copy_drops_local_state(self):
         junk = self.tmp / "junk"
         (junk / "skills" / "demo" / "__pycache__").mkdir(parents=True)

@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import tempfile
 import time
 import unittest
@@ -41,6 +42,40 @@ PROBE_SOURCE = (
 )
 PROBE_START_S = 60.0  # interpreter startup only; uv is not in this path
 DEAD_WAIT_S = 20.0
+
+# Runs inside the real runtime interpreter: reports which file the runner
+# loaded the declared-check contract from, and how it validates each case.
+# Importing runner has no side effect; nothing is started and no key is read.
+CONTRACT_PROBE_SOURCE = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import runner
+
+request = {"op": "run", "task": "t", "url": "http://127.0.0.1:9/",
+           "profile_dir": "/tmp/jev-contract-probe", "artifact_dir": "/tmp/jev-contract-probe"}
+report = {"file": runner.dom_checks.__file__, "results": []}
+for checks in json.loads(sys.stdin.read()):
+    try:
+        normalized = runner.normalize(dict(request, checks=checks))["checks"]
+        report["results"].append({"ok": True, "checks": normalized})
+    except runner.RequestError as exc:
+        report["results"].append({"ok": False, "error": str(exc)})
+sys.stdout.write(json.dumps(report))
+"""
+
+CONTRACT_CASES = [
+    None,
+    [],
+    [{"kind": "url", "equals": "https://example.test/done"},
+     {"id": "rows", "kind": "count", "selector": ".row", "equals": 3},
+     {"id": "note", "kind": "value", "selector": "#note", "contains": "line"}],
+    [{"kind": "attribute", "selector": "a", "equals": "x"}],
+    [{"kind": "count", "selector": ".r", "equals": True}],
+    [{"kind": "url", "equals": "x", "__proto__": {"kind": "url"}}],
+    [{"id": "a", "kind": "url", "equals": "x"}, {"id": "a", "kind": "title", "equals": "y"}],
+    [{"kind": "text", "equals": "x"}],
+    [{"kind": "url", "equals": "x"}] * 21,
+]
 
 
 def wait_pid_dead(pid, timeout=DEAD_WAIT_S):
@@ -87,6 +122,38 @@ class RuntimeLaunchTests(unittest.TestCase):
 
         probe = asyncio.run(scenario())
         wait_pid_dead(probe["pid"])  # the interpreter died with the group kill
+
+    def test_runtime_validates_declared_checks_with_the_wrapper_contract(self):
+        """One contract file, loaded by both boundaries, agreeing case by case.
+
+        The runtime runs in its own interpreter and its own project, so this
+        is the only place the two validators meet. No browser, no key, no
+        model call: the probe only imports the runner and calls normalize().
+        """
+        with tempfile.TemporaryDirectory(prefix="jev-contract-") as tmp:
+            probe = Path(tmp) / "contract_probe.py"
+            probe.write_text(CONTRACT_PROBE_SOURCE)
+            completed = subprocess.run(
+                [str(jev._runtime_python()), str(probe), str(jev._runtime_dir())],
+                input=json.dumps(CONTRACT_CASES),
+                capture_output=True, text=True, timeout=120, env=jev._child_env(),
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+        report = json.loads(completed.stdout)
+        self.assertEqual(Path(report["file"]).resolve(),
+                         Path(jev.checks.__file__).resolve(),
+                         "the runtime must load the wrapper's own check contract")
+        self.assertEqual(len(report["results"]), len(CONTRACT_CASES))
+        for case, outcome in zip(CONTRACT_CASES, report["results"]):
+            with self.subTest(case=repr(case)[:60]):
+                if outcome["ok"]:
+                    self.assertEqual(outcome["checks"], jev._validate_checks(case),
+                                     "both boundaries must normalize identically")
+                else:
+                    with self.assertRaises(jev.JevValidationError) as ctx:
+                        jev._validate_checks(case)
+                    self.assertEqual(ctx.exception.message, outcome["error"],
+                                     "both boundaries must reject with the same message")
 
     def test_run_without_a_key_fails_typed_before_any_model_call(self):
         """No key means no browser and no provider request, twice in a row.

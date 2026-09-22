@@ -44,6 +44,43 @@ def write_png(art, name="final.png", data=None):
     return path
 
 
+def verification_for(req, **overrides):
+    """A plausible declared-check object, one row per check in the request.
+
+    The real runtime builds this from the page; the fake builds a passing row
+    per declared check so the wrapper's contract checks have something honest
+    to inspect. Modes below break it on purpose.
+    """
+    checks = req.get("checks") or []
+    rows = []
+    for check in checks:
+        rows.append({
+            "id": check.get("id"),
+            "kind": check.get("kind"),
+            "status": "passed",
+            "reason": None,
+            "boundary": "browser_dom",
+            "check": check,
+            "observed": {"available": True, "value": check.get("equals", "seen")},
+            "captured_at_ms": 1737000000000,
+        })
+    payload = {
+        "status": "passed" if rows else "not_run",
+        "scope": "declared_dom_checks_only",
+        "boundary": "browser_dom",
+        "declared": len(rows),
+        "counts": {"passed": len(rows), "failed": 0, "unknown": 0},
+        "checked_at_url": "https://example.test/done",
+        "checked_at_title": "Done",
+        "captured_at_ms": 1737000000000 if rows else None,
+        "consistency": "single_synchronous_read" if rows else "not_read",
+        "note": "browser DOM observation; not proof a server stored anything",
+        "checks": rows,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def ok_result(req, art, **overrides):
     result = {
         "status": "completed",
@@ -90,6 +127,7 @@ def ok_result(req, art, **overrides):
         "stop_reason": "done",
         "warnings": ["viewport override applied"],
         "screenshot_path": write_png(art),
+        "verification": verification_for(req),
     }
     result.update(overrides)
     return result
@@ -187,6 +225,79 @@ def main():
         path = write_png(art, "final.jpg", data=b"\xff\xd8\xff\xe0 jpeg not png")
         emit(ok_result(req, art, screenshot_path=path))
         return
+    if mode == "checks_missing":
+        emit(ok_result(req, art, verification=None))
+        return
+    if mode == "checks_short":
+        payload = verification_for(req)
+        payload["checks"] = payload["checks"][:-1]
+        payload["declared"] = len(payload["checks"])
+        emit(ok_result(req, art, verification=payload))
+        return
+    if mode == "checks_scope":
+        emit(ok_result(req, art, verification=verification_for(req, scope="whole_task")))
+        return
+    if mode == "checks_boundary":
+        emit(ok_result(req, art, verification=verification_for(req, boundary="database")))
+        return
+    if mode == "checks_status":
+        emit(ok_result(req, art, verification=verification_for(req, status="verified")))
+        return
+    if mode == "checks_notrun":
+        emit(ok_result(req, art, verification=verification_for(req, status="not_run")))
+        return
+    if mode == "checks_invented":
+        payload = verification_for(req)
+        payload.update(status="passed", declared=1, counts={"passed": 1, "failed": 0, "unknown": 0},
+                       checks=[{"id": "invented", "kind": "url", "status": "passed",
+                                "reason": None, "boundary": "browser_dom", "check": {},
+                                "observed": {"available": True, "value": "x"},
+                                "captured_at_ms": 1}])
+        emit(ok_result(req, art, verification=payload))
+        return
+    if mode == "checks_partial":
+        # A partial stop still carries the evidence that was readable.
+        payload = verification_for(req)
+        for row in payload["checks"]:
+            row.update(status="failed", observed={"available": True, "value": "still empty"})
+        payload.update(status="failed",
+                       counts={"passed": 0, "failed": len(payload["checks"]), "unknown": 0})
+        emit({"status": "max_steps", "text": "stopped early", "steps": 2, "cost": 0.03,
+              "verification": payload})
+        return
+    if mode == "checks_extra":
+        emit(ok_result(req, art, verification=verification_for(req, status="passed")))
+        return
+    if mode == "checks_not_an_object":
+        emit(ok_result(req, art, verification=["passed"]))
+        return
+    if mode == "checks_failed":
+        payload = verification_for(req)
+        for row in payload["checks"]:
+            row.update(status="failed", observed={"available": True, "value": "something else"})
+        payload.update(status="failed",
+                       counts={"passed": 0, "failed": len(payload["checks"]), "unknown": 0})
+        result = ok_result(req, art, verification=payload)
+        result["warnings"] = result["warnings"] + ["declared DOM checks did not all pass"]
+        emit(result)
+        return
+    if mode == "checks_unknown":
+        payload = verification_for(req)
+        for row in payload["checks"]:
+            row.update(status="unknown", reason="page_unavailable",
+                       observed={"available": False, "reason": "page_unavailable"})
+        payload.update(status="unknown",
+                       counts={"passed": 0, "failed": 0, "unknown": len(payload["checks"])})
+        emit(ok_result(req, art, verification=payload))
+        return
+    if mode == "checks_leak":
+        payload = verification_for(req)
+        for row in payload["checks"]:
+            row["observed"] = {"available": True, "value": "page said " + leak}
+        payload["checked_at_url"] = "https://example.test/done?t=" + leak
+        payload["checked_at_title"] = "Done " + leak
+        emit(ok_result(req, art, verification=payload))
+        return
     if mode == "verified":
         emit(ok_result(req, art, verified=True))
         return
@@ -222,7 +333,10 @@ def main():
             "text": "login window closed", "steps": 0, "cost": 0,
             "stop_reason": "window_closed", "screenshot_path": None,
         }
-        if mode == "login_nocost":
+        if mode == "login_verification":
+            # No row, but a claim: login must never report anything but not_run.
+            result["verification"] = verification_for({}, status="passed")
+        elif mode == "login_nocost":
             result["cost"] = None
         elif mode == "login_spent":
             result["cost"] = 0.07

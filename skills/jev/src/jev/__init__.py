@@ -3,13 +3,57 @@ jev-ultrafast agent, through a separate Python 3.12 runtime project.
 
     result = await jev.run(task, url, profile="default", max_steps=25,
                            timeout_ms=120_000, max_cost_usd=0.5,
-                           values=None, generation=None)
+                           values=None, generation=None, checks=None)
     result = await jev.login(profile="default", url="https://example.com",
                              timeout_ms=600_000)
 
 jev executes browser actions. It does not extract typed answers (no schema
 argument) and it never verifies the goal: output["verification"] is always
 "not_performed" and an upstream DONE only sets output["completion_claimed"].
+
+Declared DOM checks: checks=[{"id": "saved", "kind": "text",
+"selector": "#status", "equals": "Saved"}] asks for read-only evidence from
+the page the browser ends on. Each check has an id (defaults to
+"check[<index>]"), a kind, a selector for the kinds that need one, and exactly
+one of equals or contains:
+
+    kind     reads                               selector   expectation
+    url      location.href                       no         equals/contains
+    title    document.title                      no         equals/contains
+    text     innerText of one visible element    yes        equals/contains
+    value    value of one input/textarea/select  yes        equals/contains
+    count    number of matching elements         yes        equals (whole number)
+
+At most 20 checks; ids at most 100 characters, selectors 1000, expectations
+2000. An unknown key, a missing or duplicate id, a bool or non-finite count, a
+selector on url/title, both or neither of equals/contains, or an empty
+contains is rejected with JevValidationError before any process starts, and
+the runtime validates the same request again. Only the kind and the selector
+are sent into the page; the expectation is never sent into it, and every
+comparison happens in the runtime process.
+
+The checks run once, after execution and before teardown, in one synchronous
+read, and they are read-only: no click, no typing, no navigation. They add
+result["verification"], a separate object from output["verification"]:
+
+    {"status": "passed"|"failed"|"unknown"|"not_run",
+     "scope": "declared_dom_checks_only", "boundary": "browser_dom",
+     "declared": 2, "counts": {"passed": 1, "failed": 0, "unknown": 1},
+     "checked_at_url": ..., "checked_at_title": ..., "captured_at_ms": ...,
+     "consistency": "single_synchronous_read", "note": ...,
+     "checks": [{"id", "kind", "status", "reason", "boundary", "check",
+                 "observed", "captured_at_ms"}, ...]}
+
+status is "failed" only for an observed mismatch. Missing, ambiguous,
+invisible, refused or unreadable evidence is "unknown", and no declared check
+is "not_run". A failed or unknown check does not change the run's status:
+"completed" still means the executor claimed completion, never a verified
+goal, and a passing check is DOM evidence at one instant, not proof that a
+server stored anything. A password input is refused (reason
+"sensitive_field") and its value is never returned; type=hidden and file
+inputs are refused too. Observed values for text, value, count and url checks
+are returned, redacted for known secret environment values and truncated at
+2000 characters, so a check you declare can put page content in the result.
 
 Supplied values: values={"email": "dana@example.test"} binds exact strings to
 fields. A bound value is copied into the field byte for byte, with no trimming
@@ -32,10 +76,12 @@ output, text, steps, cost (None means unknown, never a fake 0.0; a completed
 login is 0 because it makes no model call), cost_detail, usage, model,
 resolved_model, helper_model, duration_ms, stop_reason, warnings,
 screenshot_path (run: an existing absolute PNG; login: always None),
-artifact_dir, profile_dir, stderr_path. A completed run's output carries
-final_url, final_title, page_text, completion_claimed and verification; a
-completed login's output carries authenticated (always None) and
-verification. Every non-completed status raises instead of returning:
+verification (run: the declared-check object above, "not_run" when no check
+was declared; login: None), artifact_dir, profile_dir, stderr_path. A
+completed run's output carries final_url, final_title, page_text,
+completion_claimed and verification; a completed login's output carries
+authenticated (always None) and verification.
+Every non-completed status raises instead of returning:
 JevError(status, message, result), plus JevValidationError (bad arguments,
 also a ValueError), JevTimeoutError, JevProtocolError (the runner broke the
 result contract) and JevProfileInUseError.
@@ -71,7 +117,8 @@ the agent at the user's daily Chrome), and DO_NOT_TRACK=1,
 ANONYMIZED_TELEMETRY=false, BH_TELEMETRY=0 are set. os.environ itself is
 never modified. OPENROUTER_API_KEY is the only credential the runtime needs,
 and values of env vars named like API_KEY/TOKEN/SECRET/PASSWORD (length >= 8)
-are replaced with "[REDACTED]" in messages, text, page_text and error fields.
+are replaced with "[REDACTED]" in messages, text, page_text, declared-check
+evidence and error fields.
 The environment is never dumped anywhere.
 
 Importing this module has no side effects; nothing is created on disk until
@@ -92,6 +139,11 @@ import uuid
 from pathlib import Path
 from typing import Any, NoReturn
 
+from .checks import BOUNDARY as CHECK_BOUNDARY
+from .checks import SCOPE as CHECK_SCOPE
+from .checks import STATUSES as CHECK_STATUSES
+from .checks import CheckError, normalize_checks
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX platforms
@@ -109,6 +161,9 @@ __all__ = [
     "JevProfileInUseError",
     "DEFAULT_HOME",
     "VERIFICATION",
+    "CHECK_SCOPE",
+    "CHECK_BOUNDARY",
+    "CHECK_STATUSES",
 ]
 
 DEFAULT_HOME = "~/.prime/agent/jev"
@@ -298,6 +353,20 @@ def _validate_generation(generation: Any, values: dict | None) -> str:
     if generation not in _GENERATION:
         _invalid(f"generation must be 'helper', 'disabled' or None, got {generation!r}")
     return generation
+
+
+def _validate_checks(value: Any) -> list:
+    """Declared DOM checks, normalized, or []. Rejected before anything starts.
+
+    The contract lives in jev/checks.py and the runtime re-validates the same
+    request with the same function, so the two boundaries cannot drift. The
+    returned list is a private snapshot: a caller that mutates its own dicts
+    afterwards cannot change what the runner receives.
+    """
+    try:
+        return normalize_checks(value)
+    except CheckError as exc:
+        _invalid(str(exc))
 
 
 def _validate_number(value: Any, name: str, maximum: float, whole: bool = False) -> float:
@@ -586,6 +655,9 @@ def _base_result(status: Any, artifact_dir: Path, profile_dir: Path, stderr_path
         "stop_reason": None,
         "warnings": [],
         "screenshot_path": None,
+        # Structured, caller-declared DOM evidence. Separate from
+        # output["verification"], which stays the honesty constant.
+        "verification": None,
         "artifact_dir": str(artifact_dir),
         "profile_dir": str(profile_dir),
         "stderr_path": str(stderr_path),
@@ -612,7 +684,76 @@ _FIELD_RULES = {
     "resolved_model": (lambda v: isinstance(v, str), "a string"),
     "helper_model": (lambda v: isinstance(v, str), "a string"),
     "stop_reason": (lambda v: isinstance(v, str), "a string"),
+    "verification": (lambda v: isinstance(v, dict), "an object"),
 }
+
+
+def _redact_verification(payload: Any) -> Any:
+    """Redact known secret values inside declared-check evidence.
+
+    The runtime redacts the same strings with the same rule; doing it again
+    here keeps the wrapper's stated contract true for every text field it
+    returns, and redaction is idempotent.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    for key in ("checked_at_url", "checked_at_title"):
+        if isinstance(payload.get(key), str):
+            payload[key] = _redact(payload[key])
+    rows = payload.get("checks")
+    if isinstance(rows, list):
+        for row in rows:
+            observed = row.get("observed") if isinstance(row, dict) else None
+            if isinstance(observed, dict) and isinstance(observed.get("value"), str):
+                observed["value"] = _redact(observed["value"])
+    return payload
+
+
+def _check_verification(op: str, declared: int, result: dict, protocol_error) -> None:
+    """A completed result must describe exactly the checks that were declared.
+
+    A failed or unknown check never changes the run's status: `completed` stays
+    an executor claim either way. What this enforces is that the runner cannot
+    report fewer rows than were declared, cannot invent a scope, and cannot
+    call a declared set of checks "not_run".
+    """
+    payload = result.get("verification")
+    if payload is None:
+        if declared:
+            protocol_error(
+                f"completed run declared {declared} DOM check(s) but returned no verification object"
+            )
+        return
+    if not isinstance(payload, dict):
+        protocol_error(f"verification must be an object or null, got {type(payload).__name__}")
+    status = payload.get("status")
+    if status not in CHECK_STATUSES:
+        protocol_error(
+            "verification.status must be one of " + ", ".join(CHECK_STATUSES) + f", got {status!r}"
+        )
+    if payload.get("scope") != CHECK_SCOPE:
+        protocol_error(f"verification.scope must be {CHECK_SCOPE!r}, got {payload.get('scope')!r}")
+    if payload.get("boundary") != CHECK_BOUNDARY:
+        protocol_error(
+            f"verification.boundary must be {CHECK_BOUNDARY!r}, got {payload.get('boundary')!r}"
+        )
+    rows = payload.get("checks")
+    if not isinstance(rows, list) or len(rows) != declared:
+        count = len(rows) if isinstance(rows, list) else None
+        protocol_error(
+            f"verification must report one row per declared check ({declared}), got {count!r}"
+        )
+    if op == "login" and status != "not_run":
+        protocol_error(
+            "login declares no DOM check, so verification.status must be 'not_run', "
+            f"got {status!r}"
+        )
+    if declared and status == "not_run":
+        protocol_error(f"verification.status is 'not_run' but {declared} check(s) were declared")
+    if not declared and status != "not_run":
+        protocol_error(
+            f"verification.status must be 'not_run' with no declared check, got {status!r}"
+        )
 
 
 def _finish_result(
@@ -622,6 +763,7 @@ def _finish_result(
     artifact_dir: Path,
     profile_dir: Path,
     stderr_path: Path,
+    declared_checks: int = 0,
 ) -> dict:
     """Parse, type-check and normalize the runner's single stdout JSON object."""
     raw = (stdout or b"").decode("utf-8", "replace")
@@ -668,6 +810,7 @@ def _finish_result(
         profile_dir=str(profile_dir),
         stderr_path=str(stderr_path),
     )
+    result["verification"] = _redact_verification(result.get("verification"))
 
     if status != "completed":
         error = obj.get("error")
@@ -677,6 +820,7 @@ def _finish_result(
         raise error_class(status, result["error"], result)
 
     _check_completed(op, obj, result, protocol_error)
+    _check_verification(op, declared_checks, result, protocol_error)
     return result
 
 
@@ -768,6 +912,7 @@ async def _invoke_runner(
     max_cost_usd: float,
     values: dict | None = None,
     generation: str | None = None,
+    checks: list | None = None,
 ) -> dict:
     home = _home_dir()
     profiles_root = home / "profiles"
@@ -815,6 +960,8 @@ async def _invoke_runner(
                 # login opens a window and types nothing, so its request is unchanged.
                 request["values"] = values
                 request["generation"] = generation
+                # Already normalized and bounded; the runner validates it again.
+                request["checks"] = checks or []
 
             fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             stderr_fh = os.fdopen(fd, "wb")
@@ -851,7 +998,8 @@ async def _invoke_runner(
                     raise
 
                 result = _finish_result(
-                    op, stdout, proc.returncode, artifact_dir, profile_dir, stderr_path
+                    op, stdout, proc.returncode, artifact_dir, profile_dir, stderr_path,
+                    len(checks or []),
                 )
                 # The runner exited and its result parsed, but Chrome or the
                 # harness daemon could still be alive in its group. Nothing may
@@ -893,6 +1041,7 @@ async def run(
     max_cost_usd: float = 0.5,
     values: dict | None = None,
     generation: str | None = None,
+    checks: list | None = None,
 ) -> dict:
     """Run one agentic browser task from url; see the module docstring.
 
@@ -911,6 +1060,12 @@ async def run(
     generation is "helper" (the text helper may write a value no supplied value
     fits), "disabled" (skip that field) or None, which means "disabled" when
     values is given and "helper" otherwise.
+
+    checks is an optional list of up to 20 read-only DOM checks, run once after
+    execution and before teardown. They populate result["verification"] and
+    change nothing else: status stays an executor claim, and
+    output["verification"] stays "not_performed". See the module docstring for
+    the check schema and the evidence limits.
     """
     task = _validate_task(task)
     url = _validate_url(url)
@@ -920,8 +1075,10 @@ async def run(
     max_cost_usd = _validate_number(max_cost_usd, "max_cost_usd", _MAX_COST_USD)
     values = _validate_values(values)
     generation = _validate_generation(generation, values)
+    checks = _validate_checks(checks)
     return await _invoke_runner(
-        "run", task, url, profile, max_steps, timeout_ms, max_cost_usd, values, generation
+        "run", task, url, profile, max_steps, timeout_ms, max_cost_usd, values, generation,
+        checks,
     )
 
 

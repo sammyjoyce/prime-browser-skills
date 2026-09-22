@@ -1,7 +1,9 @@
 """Local fixture server for Jev runtime tests.
 
 Serves an ASCII-only page that sets a cookie and a localStorage marker, and
-records what the browser sent back. No external network access, no secrets.
+records what the browser sent back. /checks serves a second, static page for
+the declared-DOM-check group. No external network access, no secrets: every
+value on these pages is synthetic test data.
 """
 
 import json
@@ -18,6 +20,44 @@ var had = window.localStorage.getItem("jev_marker");
 if (had) { fetch("/mark?storage=1"); }
 window.localStorage.setItem("jev_marker", "present");
 document.getElementById("state").textContent = had ? "storage present" : "storage written";
+</script>
+</body></html>
+"""
+
+
+# Static, deterministic page for declared DOM checks. It counts the events a
+# mutation would produce, so a test can prove the checks only read.
+CHECKS_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Jev checks fixture</title></head>
+<body>
+<h1 id="heading">Saved</h1>
+<p id="summary">Order 4471 was saved for Dana.</p>
+<p id="invisible" style="display:none">Invisible text</p>
+<p class="ambiguous">first</p>
+<p class="ambiguous">second</p>
+<ul>
+  <li class="row">one</li>
+  <li class="row">two</li>
+  <li class="row">three</li>
+</ul>
+<form id="form" onsubmit="return false">
+  <input id="email" name="email" value="dana@example.test">
+  <input id="secret" name="secret" type="password" value="fixture-password-never-read">
+  <input id="token" name="token" type="hidden" value="fixture-hidden-csrf-value">
+  <input id="upload" name="upload" type="file">
+  <textarea id="note">note line one</textarea>
+  <select id="choice">
+    <option value="alpha">Alpha</option>
+    <option value="beta" selected>Beta</option>
+  </select>
+  <div id="editable" contenteditable="true">Editable text</div>
+  <button id="go" type="button">Do not press</button>
+</form>
+<script>
+window.__fixtureEvents = 0;
+for (var name of ["click", "input", "change", "submit", "keydown", "pointerdown"]) {
+  document.addEventListener(name, function () { window.__fixtureEvents += 1; }, true);
+}
 </script>
 </body></html>
 """
@@ -48,6 +88,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         state = Handler.state
+        if self.path.startswith("/checks"):
+            # Static: no cookie, no counter, so a re-read is always identical.
+            self._send(200, CHECKS_PAGE)
+            return
         if self.path.startswith("/mark"):
             if "storage=1" in self.path:
                 state.storage_seen = True
