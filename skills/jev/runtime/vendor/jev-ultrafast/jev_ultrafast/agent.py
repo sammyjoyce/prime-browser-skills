@@ -12,6 +12,19 @@ GENERATION = ("helper", "disabled")
 NOTHING_TYPED = "no value bound to this field; nothing typed"
 
 
+def binding_identity(action, page):
+    """Which observed field, in which document, a cached bind and text belong to.
+
+    ``node`` is the identity the snapshot gave that element, not its position in the
+    action list, and ``page_key[0]`` is the document's time origin. A second field with
+    the same label, a changed URL and a fresh document at one URL each produce a
+    different value here, so none of them can reuse the first field's text.
+    """
+    node, key = action.get("node"), page.get("page_key")
+    document = key[0] if isinstance(key, (list, tuple)) and key else None
+    return (node if type(node) is int else action.get("id"), document, page.get("url"))
+
+
 class Agent:
     def __init__(self, url, goals, *, values=None, generation="helper", record_dir=None, screenshots=False):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
@@ -143,8 +156,9 @@ class Agent:
                     raise StalePage("Page changed before text generation. Choose again.")
                 context = field_context(state["goal"], action, page, state["history"])
                 # The cache key covers the bind decision too, so a StalePage retry repeats
-                # neither the bind call nor the helper call.
-                cached = (context, sorted(self.values), self.generation)
+                # neither the bind call nor the helper call. It names the observed field and
+                # its document, so only a real retry of that same field can reuse the text.
+                cached = (binding_identity(action, page), context, sorted(self.values), self.generation)
                 if self.pending_text and self.pending_text[0] == cached:
                     _, text, helper, value_key, value_source = self.pending_text
                 else:

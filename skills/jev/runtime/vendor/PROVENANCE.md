@@ -18,7 +18,7 @@ Every other retained file is still byte-identical to that archive.
 
 | File | Change |
 |---|---|
-| `jev_ultrafast/agent.py` | Binds a caller-supplied value to a fill field, caches that bind decision beside the existing text cache, and skips a field with no bound value instead of typing a guess. |
+| `jev_ultrafast/agent.py` | Binds a caller-supplied value to a fill field, caches that bind decision beside the existing text cache under the observed field and its document, and skips a field with no bound value instead of typing a guess. |
 | `jev_ultrafast/model.py` | Adds `bind_value()`, shows supplied keys and 80-character value previews to the decision call, and lets the text helper answer `{"text": null}` without raising. |
 | `jev_ultrafast/questions.py` | Adds the `BIND_VALUE` rules text used by the new binding question. |
 | `jev_ultrafast/browser.py` | Clears a field with a Delete key event when the supplied value is the empty string. |

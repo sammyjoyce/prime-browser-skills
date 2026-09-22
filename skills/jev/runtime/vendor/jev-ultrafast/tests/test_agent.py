@@ -29,6 +29,25 @@ def page():
     return state
 
 
+def form_page(url="https://example.test/checkout", origin=1000.5):
+    """Two fields no label can tell apart, in one identified document."""
+    state = {
+        "url": url,
+        "title": "Checkout",
+        "text": "Checkout",
+        "scroll": {"y": 0},
+        "actions": [
+            {"id": "e1", "kind": "fill", "label": "First name", "role": "textbox", "value": "", "node": 10},
+            {"id": "e2", "kind": "fill", "label": "First name", "role": "textbox", "value": "", "node": 40},
+            {"id": "wait", "kind": "wait", "label": "Wait"},
+        ],
+        # page_key[0] is the document's time origin, exactly as snapshot.js reports it.
+        "page_key": [origin, url, 0, 0, 1120, 780, []],
+    }
+    state["fingerprint"] = fingerprint(state)
+    return state
+
+
 def choice(ids, selected):
     return {"choice": selected, "confidence": 1.0, "probabilities": {i: float(i == selected) for i in ids}}
 
@@ -560,6 +579,104 @@ def test_stale_retry_reuses_the_binding_without_a_second_bind_call(runner, monke
     assert runner.state["browser"].act.call_count == 2
     assert runner.state["browser"].act.call_args.kwargs["text"] == "Zurich"
     assert runner.pending_text is None
+
+
+def test_stale_retry_does_not_reuse_a_binding_on_another_field(runner, monkeypatch):
+    """Two fields carry one label. The retry must bind the field it actually selected."""
+    keys = {10: "billing_first", 40: "shipping_first"}
+    binder = Mock(side_effect=lambda goal, action, page, history, values: binding(keys[action["node"]]))
+    monkeypatch.setattr(loop, "bind_value", binder)
+    monkeypatch.setattr(loop, "choose", Mock(side_effect=[decision("e1"), decision("e2")]))
+    helper = Mock()
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"billing_first": "Ada ", "shipping_first": "Gr\u00e2ce"}
+    runner.generation = "disabled"
+    runner.state.update(page=form_page(), decision=None, status="ready")
+    runner.state["browser"].observe.return_value = form_page()
+    runner.state["browser"].act.side_effect = [StalePage("Changed before input"), None]
+    runner.command("tick")  # binds billing_first for e1; the page changes before any input
+    runner.command("tick")  # the new decision selects the other field with the same label
+    assert binder.call_count == 2
+    assert [c.args[1]["node"] for c in binder.call_args_list] == [10, 40]
+    assert runner.state["browser"].act.call_args.kwargs["text"] == "Gr\u00e2ce"
+    entry = runner.state["history"][-1]
+    assert (entry["value_key"], entry["value_source"]) == ("shipping_first", "supplied")
+    helper.assert_not_called()
+
+
+def test_stale_retry_does_not_reuse_a_binding_from_another_url(runner, monkeypatch):
+    binder = Mock(return_value=binding("code"))
+    monkeypatch.setattr(loop, "bind_value", binder)
+    runner.values = {"code": "ALPHA"}
+    runner.generation = "disabled"
+    first, second = form_page(), form_page(url="https://example.test/checkout?step=2")
+    # Same label, same value, same page text: only the address moved on.
+    assert model.field_context("Find a book", first["actions"][0], first, []) == model.field_context(
+        "Find a book", second["actions"][0], second, []
+    )
+    runner.state.update(page=first, decision=decision("e1"))
+    runner.state["browser"].act.side_effect = [StalePage("Changed before input"), None]
+    with pytest.raises(StalePage):
+        act(runner)
+    runner.state.update(page=second, decision=decision("e1"))
+    act(runner)
+    assert binder.call_count == 2
+    assert [c.args[2]["url"] for c in binder.call_args_list] == [first["url"], second["url"]]
+
+
+def test_stale_retry_does_not_reuse_a_binding_across_documents_at_one_url(runner, monkeypatch):
+    """A reload at the same URL renumbers nodes from scratch, so the node alone proves nothing."""
+    binder = Mock(return_value=binding("code"))
+    monkeypatch.setattr(loop, "bind_value", binder)
+    runner.values = {"code": "ALPHA"}
+    runner.generation = "disabled"
+    first, second = form_page(origin=1000.5), form_page(origin=2000.5)
+    assert first["fingerprint"] == second["fingerprint"]  # url, text, actions and scroll all match
+    runner.state.update(page=first, decision=decision("e1"))
+    runner.state["browser"].act.side_effect = [StalePage("Changed before input"), None]
+    with pytest.raises(StalePage):
+        act(runner)
+    runner.state.update(page=second, decision=decision("e1"))
+    act(runner)
+    assert binder.call_count == 2
+
+
+def test_stale_retry_reuses_the_binding_for_the_same_field_and_document(runner, monkeypatch):
+    """A re-observation of the same field in the same document still costs one bind."""
+    binder = Mock(return_value=binding("code"))
+    monkeypatch.setattr(loop, "bind_value", binder)
+    helper = Mock()
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.values = {"code": "ALPHA "}
+    runner.generation = "disabled"
+    runner.state.update(page=form_page(), decision=decision("e1"))
+    runner.state["browser"].act.side_effect = [StalePage("Changed before input"), None]
+    with pytest.raises(StalePage):
+        act(runner)
+    runner.state.update(page=form_page(), decision=decision("e1"))  # observed again, same document
+    act(runner)
+    assert binder.call_count == 1
+    helper.assert_not_called()
+    assert runner.state["browser"].act.call_args.kwargs["text"] == "ALPHA "
+    assert runner.pending_text is None
+
+
+def test_stale_retry_does_not_reuse_generated_text_on_another_field(runner, monkeypatch):
+    helper = Mock(side_effect=[("Ada ", {"model": "test", "latency_ms": 10}),
+                               ("Gr\u00e2ce", {"model": "test", "latency_ms": 10})])
+    monkeypatch.setattr(loop, "field_text", helper)
+    binder = Mock()
+    monkeypatch.setattr(loop, "bind_value", binder)
+    runner.state.update(page=form_page(), decision=decision("e1"))
+    runner.state["browser"].act.side_effect = [StalePage("Changed before input"), None]
+    with pytest.raises(StalePage):
+        act(runner)
+    runner.state.update(page=form_page(), decision=decision("e2"))
+    act(runner)
+    assert helper.call_count == 2
+    assert runner.state["browser"].act.call_args.kwargs["text"] == "Gr\u00e2ce"
+    assert runner.state["history"][-1]["value_source"] == "helper"
+    binder.assert_not_called()
 
 
 def cdp_recorder(calls, target=None):
